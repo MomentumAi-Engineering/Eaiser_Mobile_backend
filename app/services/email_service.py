@@ -1,0 +1,537 @@
+import os
+from dotenv import load_dotenv
+import logging
+from typing import List, Tuple, Optional, Dict, Any
+import base64
+import asyncio
+from fastapi import HTTPException
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, ContentId, Email
+from python_http_client.exceptions import UnauthorizedError, BadRequestsError
+
+# --------------------------------------------------------------------
+# ✅ Environment & Logger Setup
+# --------------------------------------------------------------------
+load_dotenv()
+logger = logging.getLogger("email_service")
+logger.setLevel(logging.INFO)
+
+# --------------------------------------------------------------------
+# ✅ Core Async Email Sender with Improved Error Handling
+# --------------------------------------------------------------------
+async def send_email(
+    to_email: str,
+    subject: str,
+    html_content: str,
+    text_content: str,
+    attachments: Optional[List[str]] = None,
+    embedded_images: Optional[List[Tuple[str, str, str]]] = None,
+    retry: bool = True
+) -> bool:
+    """
+    Sends an email via SendGrid API with inline images and attachments.
+    Automatically retries once on transient failures.
+    """
+    email_user = os.getenv("EMAIL_USER", "no-reply@eaiser.ai")
+    sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+    env = os.getenv("ENV", "development").lower()
+    # Default dry_run to False so emails send by default unless explicitly disabled
+    dry_run = os.getenv("EMAIL_DRY_RUN", "false").lower() == "true"
+
+    # Only skip if dry_run is explicitly enabled
+    if dry_run:
+        logger.info(
+            f"🧪 Email dry-run enabled. Would send to {to_email} subject='{subject}'."
+        )
+        return True
+
+    # Validating Env Vars with detailed logs
+    if not email_user or not sendgrid_api_key:
+        logger.error(f"❌ EMAIL CONFIG MISSING! User={email_user}, Key={'Set' if sendgrid_api_key else 'None'}, Env={env}")
+        # Try re-loading env
+        from dotenv import load_dotenv
+        from pathlib import Path
+        env_path = Path(__file__).parent.parent / '.env'
+        load_dotenv(dotenv_path=env_path, override=True)
+        email_user = os.getenv("EMAIL_USER", "no-reply@eaiser.ai")
+        sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+        logger.info(f"🔄 Reloaded .env from {env_path}. User={email_user}, Key={'Set' if sendgrid_api_key else 'None'}")
+
+    if not all([email_user, sendgrid_api_key]):
+        raise ValueError("Missing email configuration even after reload")
+
+    logger.info(f"📧 send_email INIT: From={email_user}, To={to_email}, Subject='{subject}'")
+    
+    # Build SendGrid mail object
+    message = Mail(
+        from_email=Email(email_user),
+        to_emails=to_email,
+        subject=subject,
+        plain_text_content=text_content,
+        html_content=html_content
+    )
+
+    # Add inline images
+    if embedded_images:
+        for cid, base64_data, mime_type in embedded_images:
+            try:
+                img_data = base64.b64decode(base64_data)
+                encoded = base64.b64encode(img_data).decode()
+                attachment = Attachment()
+                attachment.file_content = FileContent(encoded)
+                attachment.file_type = mime_type
+                attachment.file_name = f"{cid}.{mime_type.split('/')[-1]}"
+                attachment.disposition = "inline"
+                attachment.content_id = ContentId(cid)
+                message.add_attachment(attachment)
+                logger.debug(f"🖼️ Embedded image {cid} added.")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to embed image {cid}: {e}")
+
+    # Add attachments
+    if attachments:
+        for file_path in attachments:
+            try:
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                encoded = base64.b64encode(data).decode()
+                attachment = Attachment()
+                attachment.file_content = FileContent(encoded)
+                attachment.file_type = "application/octet-stream"
+                attachment.file_name = os.path.basename(file_path)
+                attachment.disposition = "attachment"
+                message.add_attachment(attachment)
+                logger.debug(f"📎 Attached file: {file_path}")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to attach file {file_path}: {e}")
+
+    # Send via SendGrid
+    try:
+        logger.info(f"📤 Sending email FROM {email_user} TO {to_email} with subject: {subject}")
+        sg = SendGridAPIClient(sendgrid_api_key)
+        response = sg.send(message)
+
+        # Log response for diagnostics
+        logger.info(f"📨 SendGrid response status: {response.status_code}")
+        if hasattr(response, "body") and response.body:
+            logger.debug(f"📄 SendGrid response body: {response.body.decode() if isinstance(response.body, bytes) else response.body}")
+
+        if response.status_code in (200, 202):
+            logger.info(f"✅ Email successfully sent to {to_email}")
+            return True
+        else:
+            logger.warning(f"⚠️ SendGrid API returned {response.status_code} for {to_email}")
+            if retry:
+                logger.info("🔁 Retrying once after 2 seconds...")
+                await asyncio.sleep(2)
+                return await send_email(to_email, subject, html_content, text_content, attachments, embedded_images, retry=False)
+            return False
+
+    except UnauthorizedError:
+        # Treat 401/403 as soft failures; log and do not crash
+        logger.error("❌ SendGrid unauthorized — invalid API key.")
+        return False
+    except BadRequestsError as e:
+        logger.error(f"❌ Bad Request to SendGrid: {e}")
+        return False
+    except Exception as e:
+        err_text = str(e)
+        if "403" in err_text or "Forbidden" in err_text:
+            logger.error(f"🚫 SendGrid 403 Forbidden. The 'From' address ({email_user}) is likely not verified in SendGrid. Please verify it in SendGrid Settings > Sender Authentication.")
+            return False
+        logger.error(f"❌ Unexpected error sending email to {to_email}: {e}", exc_info=True)
+        return False
+
+
+# --------------------------------------------------------------------
+# ✅ Synchronous Wrapper for Celery/Testing
+# --------------------------------------------------------------------
+def send_email_sync(
+    to_email: str,
+    subject: str,
+    html_content: str,
+    text_content: str,
+    attachments: Optional[List[str]] = None,
+    embedded_images: Optional[List[Tuple[str, str, str]]] = None
+) -> bool:
+    """Run async send_email synchronously (for local testing or Celery)."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            send_email(to_email, subject, html_content, text_content, attachments, embedded_images)
+        )
+    except Exception as e:
+        logger.error(f"❌ Sync wrapper failed: {e}")
+        return False
+    finally:
+        loop.close()
+
+
+# --------------------------------------------------------------------
+# ✅ EmailService Class for Issue Notifications
+# --------------------------------------------------------------------
+class EmailService:
+    async def send_issue_notification(self, authorities: List[Dict[str, Any]], issue_data: Dict[str, Any], issue_id: str) -> bool:
+        """Send AI-detected issue notification emails to relevant authorities."""
+        try:
+            subject = f"New Issue Report #{issue_data.get('report_id', issue_id)}"
+            text_content = (
+                f"Issue ID: {issue_id}\n"
+                f"Type: {issue_data.get('issue_type')}\n"
+                f"Severity: {issue_data.get('severity')}\n"
+                f"Description: {issue_data.get('description', 'N/A')}\n"
+                f"Location: {issue_data.get('address', 'N/A')} (ZIP: {issue_data.get('zip_code', 'N/A')})\n"
+            )
+            html_content = (
+                f"<h3>🛰️ New Issue Report Detected</h3>"
+                f"<p><strong>Issue ID:</strong> {issue_id}</p>"
+                f"<p><strong>Type:</strong> {issue_data.get('issue_type')}</p>"
+                f"<p><strong>Severity:</strong> {issue_data.get('severity')}</p>"
+                f"<p><strong>Description:</strong> {issue_data.get('description', 'N/A')}</p>"
+                f"<p><strong>Location:</strong> {issue_data.get('address', 'N/A')} (ZIP: {issue_data.get('zip_code', 'N/A')})</p>"
+            )
+
+            sent_any = False
+            for auth in authorities:
+                to_email = auth.get('email') or auth.get('contact_email')
+                if not to_email:
+                    logger.warning(f"⚠️ Skipping authority without email: {auth}")
+                    continue
+                ok = await send_email(to_email, subject, html_content, text_content)
+                sent_any = sent_any or ok
+
+            logger.info(f"📬 Issue email notifications sent: {sent_any}")
+            return sent_any
+
+        except Exception as e:
+            logger.error(f"❌ Issue notification failed: {e}", exc_info=True)
+            return False
+
+
+def get_email_service() -> EmailService:
+    """Return a reusable instance of EmailService."""
+    return EmailService()
+
+
+# --------------------------------------------------------------------
+# ✅ Send AI-Formatted Alert to Authorities (EAiSER Alert)
+# --------------------------------------------------------------------
+async def send_formatted_ai_alert(report: Dict[str, Any], background: bool = True) -> Dict[str, Any]:
+    """
+    Send the AI-generated formatted EAiSER alert to authorities.
+    Uses the 'formatted_report' field from the AI report.
+    """
+    try:
+        env = os.getenv("ENV", "development").lower()
+        dry_run = os.getenv("EMAIL_DRY_RUN", "false").lower() == "true"
+        formatted_content = report.get("formatted_report", "")
+        issue_type = report.get("issue_overview", {}).get("type", "Issue")
+        report_id = report.get("template_fields", {}).get("oid", "N/A")
+        priority = report.get("template_fields", {}).get("priority", "N/A")
+        subject = f"EAiSER Alert – {issue_type} (Priority: {priority}, ID: {report_id})"
+
+        authorities = report.get("responsible_authorities_or_parties") or report.get("available_authorities") or []
+        recipients = [a.get("email") for a in authorities if isinstance(a, dict) and a.get("email")]
+
+        if not recipients:
+            logger.warning("⚠️ No recipients found in AI report.")
+            return {"status": "no_recipients", "recipients": []}
+
+        # Only skip if dry_run is explicitly enabled
+        if dry_run:
+            logger.info(
+                f"🧪 Email dry-run active. Skipping send to {len(recipients)} recipients"
+            )
+            return {"status": "dry_run", "recipients": recipients}
+
+        async def _send(to_email: str):
+            html = formatted_content.replace("\n", "<br>")
+            return await send_email(to_email, subject, html, formatted_content)
+
+        if background:
+            for r in recipients:
+                asyncio.create_task(_send(r))
+            logger.info(f"📤 Dispatched EAiSER Alert to {len(recipients)} authorities (background mode)")
+            return {"status": "dispatched", "recipients": recipients}
+        else:
+            sent, failed = [], []
+            for r in recipients:
+                ok = await _send(r)
+                (sent if ok else failed).append(r)
+            return {"status": "completed", "sent": sent, "failed": failed}
+
+    except Exception as e:
+        logger.error(f"❌ send_formatted_ai_alert failed: {str(e)}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+# --------------------------------------------------------------------
+# ✅ Notify User Status Change
+# --------------------------------------------------------------------
+async def notify_user_status_change(user_email: str, issue_id: str, status: str, notes: Optional[str] = None) -> bool:
+    """
+    Notify the user that their report status has changed (Approved/Rejected).
+    """
+    try:
+        subject = f"Update on your Report #{issue_id}"
+        
+        status_color = "green" if status == "approved" else "red"
+        status_display = "APPROVED" if status == "approved" else "DECLINED"
+        
+        html_content = f"""
+        <h2>Report Status Update</h2>
+        <p>Your report (ID: <strong>{issue_id}</strong>) has been updated.</p>
+        <p>New Status: <strong style="color: {status_color}">{status_display}</strong></p>
+        """
+        
+        if notes:
+            html_content += f"<p><strong>Admin Notes:</strong> {notes}</p>"
+            
+        html_content += "<p>Thank you for using EAiSER Ai.</p>"
+        
+        text_content = f"Your report {issue_id} has been {status_display}.\n"
+        if notes:
+            text_content += f"Notes: {notes}\n"
+            
+        return await send_email(user_email, subject, html_content, text_content)
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_email}: {e}")
+        return False
+
+
+# --------------------------------------------------------------------
+# ✅ Admin Welcome Email (Animated & Professional)
+# --------------------------------------------------------------------
+
+ADMIN_DASHBOARD_URL = "https://www.eaiser.ai/admin"
+
+async def send_admin_welcome_email(
+    admin_email: str,
+    admin_name: str,
+    role: str,
+    temporary_password: str,
+    created_by: str
+) -> bool:
+    """
+    Sends a professional, animated welcome email to newly created admins.
+    """
+    try:
+        # ----------------------------
+        # Role Permissions Mapping
+        # ----------------------------
+        role_permissions = {
+            "super_admin": "Full system access — manage admins, assign issues, approve or decline reports.",
+            "admin": "Manage team members, assign issues, approve or decline reports.",
+            "team_member": "Handle assigned issues and review reports.",
+            "viewer": "Read-only access to dashboards and reports."
+        }
+
+        permissions_text = role_permissions.get(
+            role,
+            "Standard administrative access."
+        )
+
+        subject = f"Welcome to EAiSER — {role.replace('_', ' ').title()} Access Granted"
+
+        # ----------------------------
+        # HTML EMAIL (ANIMATED + PRO)
+        # ----------------------------
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Welcome to EAiSER</title>
+<style>
+  body {{
+    background-color: #020617; /* Dark slate background */
+    margin: 0;
+    padding: 0;
+    font-family: 'Segoe UI', Arial, sans-serif;
+  }}
+  .container {{
+    max-width: 620px;
+    margin: 40px auto;
+    background: #ffffff;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 25px 70px rgba(0,0,0,0.45);
+    animation: slideUp 0.9s ease-out;
+  }}
+  @keyframes slideUp {{
+    from {{ opacity: 0; transform: translateY(25px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+  }}
+  .header {{
+    background: linear-gradient(135deg, #4f46e5, #9333ea);
+    padding: 35px;
+    text-align: center;
+    color: #ffffff;
+  }}
+  .header h1 {{
+    margin: 0;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }}
+  .header p {{
+    margin: 10px 0 0;
+    font-size: 16px;
+    opacity: 0.9;
+  }}
+  .content {{
+    padding: 35px;
+    color: #334155;
+    font-size: 15px;
+    line-height: 1.7;
+  }}
+  .card {{
+    background: #f8fafc;
+    border-radius: 10px;
+    padding: 22px;
+    margin: 25px 0;
+    border-left: 4px solid #6366f1;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  }}
+  .card h3 {{
+    margin-top: 0;
+    color: #1e293b;
+    font-size: 18px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .card code {{
+    background: #e5e7eb;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-family: 'Consolas', monospace;
+    font-size: 15px;
+    font-weight: 600;
+    color: #334155;
+    display: inline-block;
+    margin-top: 6px;
+    letter-spacing: 1px;
+  }}
+  .cta {{
+    text-align: center;
+    margin: 35px 0;
+  }}
+  .cta a {{
+    background: linear-gradient(135deg, #4f46e5, #9333ea);
+    color: white;
+    padding: 16px 48px;
+    border-radius: 50px;
+    text-decoration: none;
+    font-size: 16px;
+    font-weight: 600;
+    display: inline-block;
+    box-shadow: 0 10px 20px rgba(79, 70, 229, 0.3);
+    transition: all 0.25s ease;
+  }}
+  .cta a:hover {{
+    transform: translateY(-2px);
+    box-shadow: 0 15px 30px rgba(79, 70, 229, 0.5);
+  }}
+  .footer {{
+    text-align: center;
+    font-size: 12px;
+    color: #64748b;
+    background: #f1f5f9;
+    padding: 20px;
+    border-top: 1px solid #e2e8f0;
+  }}
+</style>
+</head>
+
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>EAiSER Access</h1>
+      <p>AI-Driven Civic Intelligence Platform</p>
+    </div>
+
+    <div class="content">
+      <p>Hello <strong>{admin_name}</strong>,</p>
+
+      <p>
+        You have been officially onboarded by <strong>{created_by}</strong> as a
+        <strong>{role.replace('_', ' ').title()}</strong>.
+      </p>
+
+      <div class="card">
+        <h3>🔐 Login Credentials</h3>
+        <p><strong>Email:</strong> {admin_email}</p>
+        <p><strong>Temporary Password:</strong><br/>
+          <code>{temporary_password}</code>
+        </p>
+        <p style="color:#ef4444;font-size:13px; font-weight:500;">
+          ⚠️ For security, please change your password immediately after logging in.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>🛡️ Your Permissions</h3>
+        <p>{permissions_text}</p>
+      </div>
+
+      <div class="cta">
+        <a href="{ADMIN_DASHBOARD_URL}">
+          Launch Admin Dashboard
+        </a>
+      </div>
+      
+      <p style="text-align:center; color:#64748b; margin-top:30px;">
+        Welcome to the team. Let's make a difference.
+      </p>
+    </div>
+
+    <div class="footer">
+      © {created_by} · EAiSER Platform<br/>
+      Secure · Scalable · Intelligent
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+        # ----------------------------
+        # TEXT EMAIL (Fallback)
+        # ----------------------------
+        text_content = f"""
+Welcome to EAiSER
+
+Hi {admin_name},
+
+You have been onboarded by {created_by} as a {role.replace('_', ' ').title()}.
+
+Your Login Credentials:
+-----------------------
+Email: {admin_email}
+Temporary Password: {temporary_password}
+
+(Please change your password after first login)
+
+Your Permissions:
+-----------------
+{permissions_text}
+
+Access Admin Dashboard:
+{ADMIN_DASHBOARD_URL}
+
+— EAiSER Platform
+"""
+
+        # ----------------------------
+        # SEND EMAIL
+        # ----------------------------
+        return await send_email(
+            to_email=admin_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Failed to send admin welcome email to {admin_email}: {e}")
+        return False

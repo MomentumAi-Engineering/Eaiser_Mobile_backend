@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node
+node_modules/
+npm-debug.log*
+.package-lock.json
+
+# Environment / secrets
+.env
+.env.*
+
+# Certificates
+certs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual Environment
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
