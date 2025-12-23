@@ -434,36 +434,19 @@ async def get_pending_reviews(
             elif status == "screened_out" or issue.get("dispatch_decision") == "reject":
                 should_show = True
             
-            # 3. Check pending issues for low confidence
+            # 3. Check pending issues - SHOW ALL FOR NOW to ensure nothing is hidden
             elif status == "pending":
-                # manual extraction
-                conf_values = []
-
-                # Extract from all known locations
-                c1 = parse_conf(issue.get("confidence"))
-                c2 = parse_conf(issue.get("report", {}).get("issue_overview", {}).get("confidence"))
-                c3 = parse_conf(issue.get("report", {}).get("template_fields", {}).get("confidence"))
-                c4 = parse_conf(issue.get("report", {}).get("unified_report", {}).get("confidence"))
+                should_show = True
                 
-                if c1 is not None: conf_values.append(c1)
-                if c2 is not None: conf_values.append(c2)
-                if c3 is not None: conf_values.append(c3)
-                if c4 is not None: conf_values.append(c4)
-                
-                # Determine effective confidence
-                effective_conf = min(conf_values) if conf_values else 0
-                
-                # Check for "fake" keywords in description
+                # Check for "fake" keywords in description just for metadata/logging
                 desc = str(issue.get("description") or "").lower()
                 ai_summary = str(issue.get("report", {}).get("issue_overview", {}).get("summary_explanation") or "").lower()
                 combined_text = desc + " " + ai_summary
-                is_fake_text = any(x in combined_text for x in ["fake", "cartoon", "ai generate"])
                 
-                if effective_conf < 70 or is_fake_text or issue.get("issue_type") == "unknown":
-                    should_show = True
-                    # Force status for UI consistency
-                    issue["status_original"] = status
-                    issue["status"] = "needs_review"
+                # Force status for UI consistency if it was just 'pending'
+                # The frontend expects 'needs_review' to show the red/orange badge
+                issue["status_original"] = status
+                issue["status"] = "needs_review"
 
             if should_show:
                 seen_ids.add(sid)
