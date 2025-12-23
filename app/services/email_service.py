@@ -48,17 +48,12 @@ async def send_email(
     # Validating Env Vars with detailed logs
     if not email_user or not sendgrid_api_key:
         logger.error(f"❌ EMAIL CONFIG MISSING! User={email_user}, Key={'Set' if sendgrid_api_key else 'None'}, Env={env}")
-        # Try re-loading env
-        from dotenv import load_dotenv
-        from pathlib import Path
-        env_path = Path(__file__).parent.parent / '.env'
-        load_dotenv(dotenv_path=env_path, override=True)
-        email_user = os.getenv("EMAIL_USER", "no-reply@eaiser.ai")
-        sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
-        logger.info(f"🔄 Reloaded .env from {env_path}. User={email_user}, Key={'Set' if sendgrid_api_key else 'None'}")
+        # Note: Do not attempt to reload .env dynamically in production as it can cause instability.
 
     if not all([email_user, sendgrid_api_key]):
-        raise ValueError("Missing email configuration even after reload")
+        # Just fail gracefully instead of crashing
+        logger.error("Missing email configuration. Emails will NOT be sent.")
+        return False
 
     logger.info(f"📧 send_email INIT: From={email_user}, To={to_email}, Subject='{subject}'")
     
@@ -84,7 +79,6 @@ async def send_email(
                 attachment.disposition = "inline"
                 attachment.content_id = ContentId(cid)
                 message.add_attachment(attachment)
-                logger.debug(f"🖼️ Embedded image {cid} added.")
             except Exception as e:
                 logger.error(f"⚠️ Failed to embed image {cid}: {e}")
 
@@ -101,7 +95,6 @@ async def send_email(
                 attachment.file_name = os.path.basename(file_path)
                 attachment.disposition = "attachment"
                 message.add_attachment(attachment)
-                logger.debug(f"📎 Attached file: {file_path}")
             except Exception as e:
                 logger.error(f"⚠️ Failed to attach file {file_path}: {e}")
 
@@ -113,9 +106,7 @@ async def send_email(
 
         # Log response for diagnostics
         logger.info(f"📨 SendGrid response status: {response.status_code}")
-        if hasattr(response, "body") and response.body:
-            logger.debug(f"📄 SendGrid response body: {response.body.decode() if isinstance(response.body, bytes) else response.body}")
-
+        
         if response.status_code in (200, 202):
             logger.info(f"✅ Email successfully sent to {to_email}")
             return True
@@ -128,18 +119,13 @@ async def send_email(
             return False
 
     except UnauthorizedError:
-        # Treat 401/403 as soft failures; log and do not crash
         logger.error("❌ SendGrid unauthorized — invalid API key.")
         return False
     except BadRequestsError as e:
         logger.error(f"❌ Bad Request to SendGrid: {e}")
         return False
     except Exception as e:
-        err_text = str(e)
-        if "403" in err_text or "Forbidden" in err_text:
-            logger.error(f"🚫 SendGrid 403 Forbidden. The 'From' address ({email_user}) is likely not verified in SendGrid. Please verify it in SendGrid Settings > Sender Authentication.")
-            return False
-        logger.error(f"❌ Unexpected error sending email to {to_email}: {e}", exc_info=True)
+        logger.error(f"❌ Unexpected error sending email to {to_email}: {e}")
         return False
 
 
