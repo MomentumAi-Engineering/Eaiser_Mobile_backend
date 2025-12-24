@@ -268,6 +268,9 @@ async def submit_report(issue_id: str, submit_data: SubmitReportRequest):
         else:
             # High confidence - direct submit to authorities
             # TODO: Implement actual email sending to authorities
+            # High confidence - direct submit to authorities
+            
+            # 1. Update DB Status First
             await db.issues.update_one(
                 {"_id": issue_id},
                 {
@@ -281,13 +284,70 @@ async def submit_report(issue_id: str, submit_data: SubmitReportRequest):
                 }
             )
             
-            logger.info(f"✅ Report submitted to authorities: {issue_id} (Confidence: {confidence}%)")
+            # 2. Trigger Email to Authorities
+            email_sent = False
+            try:
+                # Import here to avoid circular dependency
+                from routes.issues import send_authority_email
+                
+                # Fetch Image Content
+                fs = await get_fs()
+                image_id = issue.get("image_id")
+                image_content = b""
+                if image_id:
+                    try:
+                        grid_out = await fs.open_download_stream(ObjectId(image_id))
+                        image_content = await grid_out.read()
+                    except Exception as img_err:
+                         logger.warning(f"⚠️ Failed to fetch image for email: {img_err}")
+
+                # Prepare Authorities
+                # Ensure we have type and email
+                authorities = []
+                for auth in submit_data.selected_authorities:
+                    authorities.append({
+                        "name": auth.get("name", "Authority"),
+                        "email": auth.get("email"),
+                        "type": auth.get("type", "general")
+                    })
+                
+                if not authorities:
+                     # Fallback if empty (shouldn't happen if validation passes)
+                     authorities = [{"name": "Default Authority", "email": "eaiser@momntumai.com", "type": "general"}]
+
+                # Send Email
+                email_sent = await send_authority_email(
+                    issue_id=issue_id,
+                    authorities=authorities,
+                    issue_type=issue.get("issue_type", "Report"),
+                    final_address=issue.get("address", "Unknown Address"),
+                    zip_code=issue.get("zip_code", "N/A"),
+                    timestamp_formatted=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+                    report=issue.get("report", {}),
+                    confidence=float(issue.get("confidence", 0)),
+                    category=issue.get("category", "public"),
+                    timezone_name="UTC", # Simplify for now
+                    latitude=float(issue.get("latitude", 0.0)),
+                    longitude=float(issue.get("longitude", 0.0)),
+                    image_content=image_content
+                )
+                
+                if email_sent:
+                    # Update status to record email success if you want (optional)
+                    pass
+
+            except Exception as e:
+                logger.error(f"❌ Failed to send authority email (High Confidence): {e}", exc_info=True)
+                # We don't fail the request, but we log the error
+            
+            logger.info(f"✅ Report submitted to authorities: {issue_id} (Confidence: {confidence}%) | Email Sent: {email_sent}")
             
             return {
                 "success": True,
                 "status": STATUS_SUBMITTED_TO_AUTHORITY,
                 "message": "Report submitted to authorities successfully!",
-                "requires_admin_review": False
+                "requires_admin_review": False,
+                "email_sent": email_sent
             }
         
     except Exception as e:
@@ -394,6 +454,9 @@ async def admin_review_report(issue_id: str, review: AdminReviewRequest):
         
         if review.action == "approve":
             # Admin approved - submit to authorities
+            # Admin approved - submit to authorities
+            
+            # 1. Update DB Status
             await db.issues.update_one(
                 {"_id": issue_id},
                 {
@@ -409,12 +472,68 @@ async def admin_review_report(issue_id: str, review: AdminReviewRequest):
                 }
             )
             
-            logger.info(f"✅ Admin approved report: {issue_id}")
+            # 2. Trigger Email to Authorities
+            email_sent = False
+            try:
+                from routes.issues import send_authority_email
+                
+                # Fetch Image Content
+                fs = await get_fs()
+                image_id = issue.get("image_id")
+                image_content = b""
+                if image_id:
+                     try:
+                        grid_out = await fs.open_download_stream(ObjectId(image_id))
+                        image_content = await grid_out.read()
+                     except: pass
+
+                # Get Authorities (Priority: selected > report > available)
+                authorities = issue.get("selected_authorities") 
+                if not authorities and issue.get("report"):
+                     authorities = issue["report"].get("responsible_authorities_or_parties")
+                
+                # Normalize
+                final_authorities = []
+                if authorities:
+                    for auth in authorities:
+                         if isinstance(auth, dict):
+                             final_authorities.append(auth)
+                
+                if not final_authorities:
+                    # Fallback mechanism
+                    available = issue.get("available_authorities")
+                    if available:
+                        final_authorities = available
+                    else:
+                        # Hard fallback
+                        final_authorities = [{"name": "Auth", "email": "eaiser@momntumai.com", "type": "general"}]
+                
+                # Send Email
+                email_sent = await send_authority_email(
+                    issue_id=issue_id,
+                    authorities=final_authorities,
+                    issue_type=issue.get("issue_type", "Report"),
+                    final_address=issue.get("address", "Unknown Address"),
+                    zip_code=issue.get("zip_code", "N/A"),
+                    timestamp_formatted=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+                    report=issue.get("report", {}),
+                    confidence=float(issue.get("confidence", 0)),
+                    category=issue.get("category", "public"),
+                    timezone_name="UTC",
+                    latitude=float(issue.get("latitude", 0.0)),
+                    longitude=float(issue.get("longitude", 0.0)),
+                    image_content=image_content
+                )
+            except Exception as e:
+                logger.error(f"❌ Admin Approval Email Failed: {e}")
+
+            logger.info(f"✅ Admin approved report: {issue_id} | Email Sent: {email_sent}")
             
             return {
                 "success": True,
                 "status": STATUS_APPROVED_SUBMITTED,
-                "message": "Report approved and submitted to authorities"
+                "message": "Report approved and submitted to authorities",
+                "email_sent": email_sent
             }
         else:
             # Admin rejected

@@ -140,6 +140,7 @@ from api.notifications import router as notifications_router
 from routes.debug_email import router as debug_email_router
 
 app.include_router(debug_email_router, prefix="/api", tags=["Debug"])
+app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 
 # --- WEBSOCKETS ---
 @app.websocket("/ws")
