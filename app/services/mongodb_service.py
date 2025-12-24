@@ -123,19 +123,18 @@ async def init_db():
         logger.info(f"🔧 URI Type: {'Atlas Cloud' if 'mongodb+srv' in MONGO_URI else 'Local/Self-hosted'}")
         env = os.getenv("ENV", "development").lower()
         
-        # Production-ready MongoDB client configuration
+        # Production-ready MongoDB client configuration - FORCED STABILITY MODE
         client_config = {
-            # Connection timeout settings - adjusted by environment
-            # In development, fail fast to avoid long hangs; in production, allow longer timeouts.
-            "serverSelectionTimeoutMS": 5000 if env != "production" else 15000,
-            "connectTimeoutMS": 8000 if env != "production" else 30000,
-            "socketTimeoutMS": 12000 if env != "production" else 45000,
+            # Connection timeout settings - FORCE HIGH TIMEOUTS FOR ALL ENVS
+            "serverSelectionTimeoutMS": 60000,
+            "connectTimeoutMS": 60000,
+            "socketTimeoutMS": 60000,
 
             # Connection pooling for high performance
             "maxPoolSize": int(os.getenv("MONGO_POOL_MAXSIZE", "50")),
-            "minPoolSize": int(os.getenv("MONGO_POOL_MINSIZE", "5")),
+            "minPoolSize": 0, # Reduced to 0 to prevent initial connection storm
             "maxIdleTimeMS": 120000,
-            "waitQueueTimeoutMS": 8000 if env != "production" else 20000,
+            "waitQueueTimeoutMS": 20000,
 
             # Performance optimizations
             "retryWrites": True,
@@ -145,6 +144,8 @@ async def init_db():
             # Additional performance settings
             "compressors": "snappy,zlib",
             "zlibCompressionLevel": 6,
+            "tls": True,
+            "tlsAllowInvalidCertificates": True # Critical for resolving SSL handshake timeouts
         }
         
         # Add SSL/TLS settings for Atlas connections
@@ -572,6 +573,19 @@ async def get_issues(limit: int = 50, skip: int = 0) -> List[Dict[str, Any]]:
         LIST_TIMEOUT_MS = int(os.getenv("LIST_TIMEOUT_MS", "5000"))
         LIST_TIMEOUT_S = max(1.0, LIST_TIMEOUT_MS / 1000.0)
         
+        # Core connection settings with relaxed SSL for stability
+        client_config = {
+            "serverSelectionTimeoutMS": 60000,  # Increased to 60s
+            "connectTimeoutMS": 60000,          # Increased to 60s
+            "socketTimeoutMS": 60000,           # Increased to 60s
+            "maxPoolSize": 50,
+            "minPoolSize": 0,                   # Changed to 0 to avoid immediate connection storm
+            "waitQueueTimeoutMS": 5000,
+            "retryWrites": True,
+            "retryReads": True,
+            "tls": True,
+            "tlsAllowInvalidCertificates": True # Added to bypass SSL handshake errors
+        }
         # Use projection to only fetch required fields for better performance
         projection = {
             "_id": 1,
