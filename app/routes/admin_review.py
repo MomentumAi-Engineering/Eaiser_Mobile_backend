@@ -197,6 +197,7 @@ async def deactivate_user(action: UserAction, admin: dict = Depends(get_admin_us
     except Exception as e:
         logger.error(f"Error deactivating user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+@router.post("/login")
 async def admin_login(creds: AdminLoginRequest, request: Request):
     """
     Enhanced admin login with security features:
