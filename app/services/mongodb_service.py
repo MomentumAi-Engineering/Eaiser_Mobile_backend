@@ -262,7 +262,11 @@ async def create_indexes() -> None:
 
         logger.info("✅ Core MongoDB indexes created/verified")
     except Exception as e:
-        logger.warning(f"⚠️ Index creation encountered an issue: {str(e)}")
+        # Ignore IndexOptionsConflict (code 85) - likely existing index with different options
+        if hasattr(e, 'code') and e.code == 85:
+            logger.warning(f"⚠️ Index conflict ignored (likely pre-existing): {str(e)}")
+        else:
+            logger.warning(f"⚠️ Index creation encountered an issue: {str(e)}")
 
 async def close_db():
     """Close database connection"""

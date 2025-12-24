@@ -707,18 +707,38 @@ async def approve_issue(action: ReviewAction): # Removed auth dependency for deb
                         logger.warning(f"Failed to fetch image {image_id} for email: {e}")
 
                 # Prepare authorities list
-                # If we updated it in step 2.5, use that. Or use what's in report.
-                current_authorities = issue["report"].get("responsible_authorities_or_parties", [])
+                # Priority: 
+                # 1. Manually assigned auth (Step 2.5 above handles this by updating issue['report'])
+                # 2. Responsible authorities in report
+                # 3. Available authorities in issue root
                 
+                raw_authorities = issue.get("report", {}).get("responsible_authorities_or_parties", [])
+                
+                if not raw_authorities:
+                    # Fallback to available_authorities if responsible is empty
+                    raw_authorities = issue.get("available_authorities", [])
+                    logger.info(f"Using fallback 'available_authorities' for issue {action.issue_id}: {len(raw_authorities)} found")
+
+                if not raw_authorities:
+                     logger.warning(f"⚠️ NO AUTHORITIES FOUND for issue {action.issue_id} - Email will likely fail or go to default.")
+
                 # Normalize authorities format for email function
                 # send_authority_email expects List[Dict[str, str]] with name, email
                 email_auths = []
-                for a in current_authorities:
-                    email_auths.append({
-                        "name": a.get("name", "Authority"), 
-                        "email": a.get("email"),
-                        "type": a.get("type", "general")
-                    })
+                for a in raw_authorities:
+                    # Handle both dictionary and string formats if any
+                    if isinstance(a, dict):
+                        email_auths.append({
+                            "name": a.get("name", "Authority"), 
+                            "email": a.get("email"),
+                            "type": a.get("type", "general")
+                        })
+                    else:
+                         logger.warning(f"Skipping malformed authority entry: {a}")
+                
+                if not email_auths:
+                    # If normalization resulted in empty list, try to use a default or log error
+                     logger.error(f"❌ No valid authority emails extracted for issue {action.issue_id}")
                 
                 email_success = await send_authority_email(
                     issue_id=str(issue["_id"]),

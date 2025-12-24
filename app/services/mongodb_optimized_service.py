@@ -243,7 +243,12 @@ class OptimizedMongoDBService:
             logger.info("✅ All database indexes created successfully")
             
         except Exception as e:
-            logger.error(f"❌ Failed to create indexes: {str(e)}")
+            # Ignore IndexOptionsConflict (code 85) - likely existing index with different options
+            if hasattr(e, 'code') and e.code == 85:
+                # Log as warning but don't fail startup
+                logger.warning(f"⚠️ Index conflict ignored in optimized service (likely pre-existing): {str(e)}")
+            else:
+                logger.error(f"❌ Failed to create indexes: {str(e)}")
     
     @asynccontextmanager
     async def _safe_operation(self, operation_type='read'):
