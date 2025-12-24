@@ -55,10 +55,148 @@ class UserAction(BaseModel):
     user_email: str
     reason: str
     admin_id: str
+    issue_id: Optional[str] = None
+    force_confirm: Optional[bool] = False
 
-# --- Endpoints ---
+class UpdateStatusRequest(BaseModel):
+    issue_id: str
+    status: str
+    notes: Optional[str] = None
+    admin_id: str
 
-@router.post("/login")
+# ... existing endpoints ...
+
+@router.post("/set-status")
+async def set_issue_status(action: UpdateStatusRequest, admin: dict = Depends(get_admin_user)):
+    """
+    Ticket 4: Intermediate Report State
+    Set specific status like 'no_action_required' or 'needs_support_guidance'.
+    """
+    valid_statuses = [
+        "approved", "rejected", "submitted", "pending", "needs_review", 
+        "no_action_required", "needs_support_guidance", "revision_required", "screened_out"
+    ]
+    
+    if action.status not in valid_statuses:
+         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of {valid_statuses}")
+
+    mongo_service = await get_optimized_mongodb_service()
+    if not mongo_service:
+        raise HTTPException(status_code=503, detail="Database service unavailable")
+
+    # Update
+    success = await mongo_service.update_one_optimized(
+        collection_name='issues',
+        filter_dict={"_id": action.issue_id},
+        update_dict={
+            "$set": {
+                "status": action.status,
+                "admin_review": {
+                    "action": "status_update",
+                    "status_to": action.status,
+                    "admin_id": action.admin_id,
+                    "timestamp": datetime.utcnow(),
+                    "notes": action.notes
+                }
+            }
+        }
+    )
+    
+    if not success:
+        # Try ObjectId
+        try:
+            from bson.objectid import ObjectId
+            success = await mongo_service.update_one_optimized(
+                collection_name='issues',
+                filter_dict={"_id": ObjectId(action.issue_id)},
+                update_dict={
+                    "$set": {
+                        "status": action.status,
+                        "admin_review": {
+                            "action": "status_update",
+                            "status_to": action.status,
+                            "admin_id": action.admin_id,
+                            "timestamp": datetime.utcnow(),
+                            "notes": action.notes
+                        }
+                    }
+                }
+            )
+        except:
+            pass
+
+    if not success:
+         raise HTTPException(status_code=404, detail="Issue not found")
+
+    logger.info(f"✅ Issue {action.issue_id} status updated to {action.status}")
+    return {"message": f"Status updated to {action.status}", "issue_id": action.issue_id}
+
+
+@router.post("/deactivate-user")
+async def deactivate_user(action: UserAction, admin: dict = Depends(get_admin_user)):
+    """
+    Deactivate a user account (e.g. for spamming fake reports).
+    Ticket 5: Logic Safeguards for Low Confidence
+    """
+    try:
+        mongo_service = await get_optimized_mongodb_service()
+        if not mongo_service:
+            raise HTTPException(status_code=503, detail="Database service unavailable")
+            
+        # Logic Safeguard: Check Issue Confidence if issue_id provided
+        if action.issue_id and not action.force_confirm:
+            try:
+                # Fetch issue to check confidence
+                issue = await mongo_service.get_issue_by_id(action.issue_id)
+                if issue:
+                    conf = issue.get("confidence", 100)
+                    # Also check report fields just in case
+                    if hasattr(issue, "get"):
+                         report_conf = issue.get("report", {}).get("issue_overview", {}).get("confidence")
+                         if report_conf is not None:
+                             conf = report_conf
+                    
+                    try:
+                        conf = float(conf)
+                    except:
+                        conf = 0
+                        
+                    if conf < 50:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"⚠️ SAFETY WARNING: This report has low confidence ({conf}%). Deactivating user might be a mistake. Please verify or use 'force_confirm' to proceed."
+                        )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"Failed to verify issue confidence during deactivation: {e}")
+                # Don't block if check fails, but log it
+
+        # Check if users collection exists or we just blacklist
+        # For now, let's assume we update a 'users' collection or add to 'blacklisted_users'
+        
+        # Check for user by email
+        user = await mongo_service.db.users.find_one({"email": action.user_email})
+        if user:
+            await mongo_service.db.users.update_one(
+                {"email": action.user_email},
+                {"$set": {"is_active": False, "deactivation_reason": action.reason}}
+            )
+        else:
+            # If user collection user doesn't exist (maybe only in issues), create blacklist entry?
+            await mongo_service.db.blacklisted_users.update_one(
+                {"email": action.user_email},
+                {"$set": {"email": action.user_email, "reason": action.reason, "admin_id": action.admin_id, "timestamp": datetime.utcnow()}},
+                upsert=True
+            )
+            
+        return {"message": f"User {action.user_email} deactivated."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deactivating user: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 async def admin_login(creds: AdminLoginRequest, request: Request):
     """
     Enhanced admin login with security features:
@@ -1061,42 +1199,7 @@ async def skip_review(action: ReviewAction, admin: dict = Depends(get_admin_user
     # Assuming Skip means "I don't know, leave it for now" -> no action on status
     return {"message": "Review skipped (no action taken)", "issue_id": action.issue_id}
 
-@router.post("/deactivate-user")
-async def deactivate_user(action: UserAction, admin: dict = Depends(get_admin_user)):
-    """
-    Deactivate a user account (e.g. for spamming fake reports).
-    """
-    try:
-        mongo_service = await get_optimized_mongodb_service()
-        if not mongo_service:
-            raise HTTPException(status_code=503, detail="Database service unavailable")
-            
-        # Assuming there is a 'users' collection. 
-        # If not, we might blacklist the email in a separate collection.
-        
-        # Check if users collection exists or we just blacklist
-        # For now, let's assume we update a 'users' collection or add to 'blacklisted_users'
-        
-        # Check for user by email
-        user = await mongo_service.db.users.find_one({"email": action.user_email})
-        if user:
-            await mongo_service.db.users.update_one(
-                {"email": action.user_email},
-                {"$set": {"is_active": False, "deactivation_reason": action.reason}}
-            )
-        else:
-            # If user collection user doesn't exist (maybe only in issues), create blacklist entry?
-            await mongo_service.db.blacklisted_users.update_one(
-                {"email": action.user_email},
-                {"$set": {"email": action.user_email, "reason": action.reason, "admin_id": action.admin_id, "timestamp": datetime.utcnow()}},
-                upsert=True
-            )
-            
-        return {"message": f"User {action.user_email} deactivated."}
 
-    except Exception as e:
-        logger.error(f"Error deactivating user: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/delete/{admin_id}")
 async def delete_admin(admin_id: str, current_admin: dict = Depends(get_admin_user)):

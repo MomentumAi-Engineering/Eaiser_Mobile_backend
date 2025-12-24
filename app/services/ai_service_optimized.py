@@ -462,11 +462,11 @@ Return ONLY JSON with actual values filled in (do NOT use template variables lik
     "confidence": {confidence:.1f}
   }},
   "ai_evaluation": {{
-    "image_analysis": "Describe what is happening in the image and which visual cues support your conclusion.",
+    "image_analysis": "Describe specifically what visual evidence leads to the conclusion. If NO issue is found, explicitly state what is CLEAN/SAFE (e.g., 'Road surface is smooth/intact', 'No visible trash'). Avoid generic 'No issue found'.",
     "issue_detected": true|false,
     "detected_issue_type": "One of the Valid Issue Types listed above or 'None'",
     "ai_confidence_percent": 0,
-    "rationale": "Brief justification referencing image clarity and visual evidence. Use integer for ai_confidence_percent only (no %). If issue_detected is false, set ai_confidence_percent between 0 and 10; if true, set between 10 and 100 based on clarity and understanding."
+    "rationale": "A single sentence summary justification. E.g., 'Visuals confirm intact infrastructure with no signs of damage'. Use integer for ai_confidence_percent only."
   }},
   "detailed_analysis": {{
     "root_causes": "Possible causes of the issue.",
@@ -798,6 +798,19 @@ Keep the report under 200 words, professional, and specific to the issue type an
 
         # RE-FETCH AUTHORITIES IF ISSUE TYPE CHANGED
         # This fixes the issue where authority assignment is wrong because it used the initial (potentially wrong) classification.
+        
+        # TICKET 3 IMPLEMENTATION: Authority Recommendation Logic Adjustment
+        # If no issue detected or confidence is low, DO NOT recommend authorities.
+        final_conf = report.get("issue_overview", {}).get("confidence", 0)
+        final_detected = report.get("ai_evaluation", {}).get("issue_detected", False)
+        
+        if not final_detected or final_conf < 50:
+            logger.info(f"Issue {issue_id}: Low confidence ({final_conf}%) or no issue detected. Clearing authorities.")
+            report["responsible_authorities_or_parties"] = []
+            report["available_authorities"] = []
+            # Add guidance advice if purely safety/no-action
+            report["recommended_actions"] = ["No civic authority notification required.", "Ticket closed as 'No Issue Detected'."]
+
         final_issue_type = (report.get("issue_overview", {}).get("type") or issue_type).lower().replace(" ", "_")
         initial_issue_type = issue_type.lower().replace(" ", "_")
         
