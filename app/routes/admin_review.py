@@ -573,20 +573,16 @@ async def get_pending_reviews(
             elif status == "screened_out" or issue.get("dispatch_decision") == "reject":
                 should_show = True
             
-            # 3. Check pending issues - SHOW ALL FOR NOW to ensure nothing is hidden
+            # 3. Check pending issues
             elif status == "pending":
                 should_show = True
-                
-                # Check for "fake" keywords in description just for metadata/logging
-                desc = str(issue.get("description") or "").lower()
-                ai_summary = str(issue.get("report", {}).get("issue_overview", {}).get("summary_explanation") or "").lower()
-                combined_text = desc + " " + ai_summary
-                
-                # Force status for UI consistency if it was just 'pending'
-                # The frontend expects 'needs_review' to show the red/orange badge
-                issue["status_original"] = status
+                # Force status for UI consistency
                 issue["status"] = "needs_review"
 
+            # 4. SHOW COMPLETED/AUTO-SUBMITTED ISSUES (For visibility/logging)
+            elif status in ["submitted_to_authority", "approved_submitted", "approved", "submitted"]:
+                should_show = True
+                
             if should_show:
                 seen_ids.add(sid)
                 
