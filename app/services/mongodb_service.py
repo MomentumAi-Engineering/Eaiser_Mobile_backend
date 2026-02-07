@@ -42,7 +42,7 @@ def get_mongodb_config():
     )
     
     # Database name from environment or default
-    db_name = os.getenv('MONGODB_NAME', 'eaiser_db_user')
+    db_name = os.getenv('MONGODB_NAME', 'eaiser')
     
     logger.info(f"🔧 MongoDB Configuration:")
     logger.info(f"   URI: {mongo_uri[:50]}{'...' if len(mongo_uri) > 50 else ''}")
@@ -123,18 +123,19 @@ async def init_db():
         logger.info(f"🔧 URI Type: {'Atlas Cloud' if 'mongodb+srv' in MONGO_URI else 'Local/Self-hosted'}")
         env = os.getenv("ENV", "development").lower()
         
-        # Production-ready MongoDB client configuration - FORCED STABILITY MODE
+        # Production-ready MongoDB client configuration
         client_config = {
-            # Connection timeout settings - FORCE HIGH TIMEOUTS FOR ALL ENVS
-            "serverSelectionTimeoutMS": 60000,
-            "connectTimeoutMS": 60000,
-            "socketTimeoutMS": 60000,
+            # Connection timeout settings - SIGNIFICANTLY INCREASED for slow networks
+            # Handshake can take >3s on bad connections, so we give it 30s+
+            "serverSelectionTimeoutMS": 30000,   # Wait 30s before giving up on finding a server
+            "connectTimeoutMS": 45000,           # Wait 45s for initial connection (SSL handshake)
+            "socketTimeoutMS": 60000,            # Wait 60s for operations to complete
 
             # Connection pooling for high performance
             "maxPoolSize": int(os.getenv("MONGO_POOL_MAXSIZE", "50")),
-            "minPoolSize": 0, # Reduced to 0 to prevent initial connection storm
+            "minPoolSize": int(os.getenv("MONGO_POOL_MINSIZE", "10")), # Increased default min pool to 10
             "maxIdleTimeMS": 120000,
-            "waitQueueTimeoutMS": 20000,
+            "waitQueueTimeoutMS": 30000,         # Wait 30s in queue before error
 
             # Performance optimizations
             "retryWrites": True,
@@ -144,8 +145,6 @@ async def init_db():
             # Additional performance settings
             "compressors": "snappy,zlib",
             "zlibCompressionLevel": 6,
-            "tls": True,
-            "tlsAllowInvalidCertificates": True # Critical for resolving SSL handshake timeouts
         }
         
         # Add SSL/TLS settings for Atlas connections
@@ -202,11 +201,12 @@ async def init_db():
         
         # Create indexes for better performance
         try:
-            # Create minimal indexes required for core queries
-            await create_indexes()
-            logger.info("📇 Database indexes created/verified successfully")
+            # OPTIMIZATION: Run index creation in background to speed up startup
+            # This prevents cold starts from hanging on index checks
+            asyncio.create_task(create_indexes())
+            logger.info("🚀 Database index creation scheduled in background")
         except Exception as e:
-            logger.warning(f"⚠️ Index creation failed: {str(e)}")
+            logger.warning(f"⚠️ Index creation scheduling failed: {str(e)}")
         
         return True
         
@@ -249,25 +249,35 @@ async def create_indexes() -> None:
         users = db["users"]
 
         # Index used by aggregation hint in get_issues()
-        await issues.create_index([("timestamp", -1)], name="timestamp_desc", background=True)
+        await issues.create_index([("timestamp", -1)], name="timestamp_desc")
 
         # Common filters and sorts
-        await issues.create_index([("status", 1), ("timestamp", -1)], name="status_timestamp", background=True)
-        await issues.create_index([("zip_code", 1)], name="zip_code", background=True)
-        await issues.create_index([("issue_type", 1)], name="issue_type", background=True)
-        await issues.create_index([("user_email", 1)], name="user_email", background=True)
-        await issues.create_index([("latitude", 1), ("longitude", 1)], name="lat_lon", background=True)
+        await issues.create_index([("status", 1), ("timestamp", -1)], name="status_timestamp")
+        await issues.create_index([("zip_code", 1)], name="zip_code")
+        await issues.create_index([("issue_type", 1)], name="issue_type")
+        await issues.create_index([("user_email", 1)], name="user_email")
+        await issues.create_index([("latitude", 1), ("longitude", 1)], name="lat_lon")
 
         # Users collection unique email
-        await users.create_index([("email", 1)], name="email_unique", unique=True, background=True)
+        try:
+            await users.create_index([("email", 1)], name="email_unique", unique=True)
+        except Exception as e:
+            # Code 85: IndexOptionsConflict - usually means it exists with different options or same options
+            if "IndexOptionsConflict" in str(e) or "already exists" in str(e) or getattr(e, "code", 0) == 85:
+                 logger.info(f"ℹ️ Index 'email_unique' already exists. Skipping.")
+            else:
+                 logger.warning(f"⚠️ Failed to create 'email_unique' index: {str(e)}")
+
+        # Authority Mapping Review indexes
+        authority_mapping_review = db["authority_mapping_review"]
+        await authority_mapping_review.create_index([("resolved", 1)], name="resolved")
+        await authority_mapping_review.create_index([("issue_type", 1)], name="issue_type")
+        await authority_mapping_review.create_index([("flagged_at", -1)], name="flagged_at_desc")
+        await authority_mapping_review.create_index([("case_id", 1)], name="case_id")
 
         logger.info("✅ Core MongoDB indexes created/verified")
     except Exception as e:
-        # Ignore IndexOptionsConflict (code 85) - likely existing index with different options
-        if hasattr(e, 'code') and e.code == 85:
-            logger.warning(f"⚠️ Index conflict ignored (likely pre-existing): {str(e)}")
-        else:
-            logger.warning(f"⚠️ Index creation encountered an issue: {str(e)}")
+        logger.warning(f"⚠️ Index creation encountered an issue: {str(e)}")
 
 async def close_db():
     """Close database connection"""
@@ -276,85 +286,11 @@ async def close_db():
         client.close()
         logger.info("🔒 MongoDB connection closed")
 
-async def initialize_db():
-    """
-    Initialize database connection with retry logic and fallback options
-    """
-    global client, db, fs
-    
-    try:
-        mongo_uri, db_name = get_mongodb_config()
-        
-        logger.info(f"🔧 MongoDB URI configured: {mongo_uri.split('@')[0].split('://')[0]}://***")
-        logger.info(f"📊 Database name: {db_name}")
-        
-        # Create MongoDB client with timeout settings
-        # Use fully qualified class name to avoid NameError
-        client = motor.motor_asyncio.AsyncIOMotorClient(
-            mongo_uri,
-            serverSelectionTimeoutMS=15000,  # 15 second timeout for Atlas
-            connectTimeoutMS=30000,  # 30 seconds for SSL handshake
-            socketTimeoutMS=45000,  # 45 seconds for operations
-            maxPoolSize=10,
-            retryWrites=True
-        )
-        
-        # Test connection with retry logic
-        max_retries = 3
-        retry_delay = 2.0
-        
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"🔄 Connection attempt {attempt}/{max_retries}...")
-                
-                # Test the connection
-                await client.admin.command('ping')
-                
-                # Connection successful
-                db = client[db_name]
-                fs = motor.motor_asyncio.AsyncIOMotorGridFSBucket(db)
-                
-                logger.info(f"✅ MongoDB connected successfully!")
-                logger.info(f"📊 Database: {db_name}")
-                logger.info(f"🔗 Connection: Active")
-                
-                return True
-                
-            except Exception as e:
-                logger.warning(f"⚠️ Connection attempt {attempt} failed: {str(e)}")
-                
-                if attempt < max_retries:
-                    logger.info(f"⏳ Waiting {retry_delay}s before retry...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2.25  # Exponential backoff
-                else:
-                    logger.error(f"❌ All connection attempts failed")
-                    
-                    # Fallback for development
-                    if 'localhost' in mongo_uri:
-                        logger.info(f"🔄 Falling back to in-memory storage for development...")
-                        client = None
-                        db = None
-                        fs = None
-                        return False
-                    else:
-                        raise e
-                        
-    except Exception as e:
-        logger.error(f"❌ MongoDB initialization failed: {str(e)}")
-        logger.info(f"🔄 Running in fallback mode (no persistent storage)")
-        
-        # Set to None for fallback mode
-        client = None
-        db = None
-        fs = None
-        return False
-
 async def get_db():
     """Get the async database connection."""
     global db
     if db is None:
-        await initialize_db()
+        await init_db()
     if db is None:
         raise RuntimeError("Async database connection could not be established")
     return db
@@ -363,7 +299,7 @@ async def get_fs():
     """Get the async GridFS instance."""
     global fs
     if fs is None:
-        await initialize_db()
+        await init_db()
     if fs is None:
         raise RuntimeError("Async GridFS could not be initialized")
     return fs
@@ -573,19 +509,6 @@ async def get_issues(limit: int = 50, skip: int = 0) -> List[Dict[str, Any]]:
         LIST_TIMEOUT_MS = int(os.getenv("LIST_TIMEOUT_MS", "5000"))
         LIST_TIMEOUT_S = max(1.0, LIST_TIMEOUT_MS / 1000.0)
         
-        # Core connection settings with relaxed SSL for stability
-        client_config = {
-            "serverSelectionTimeoutMS": 60000,  # Increased to 60s
-            "connectTimeoutMS": 60000,          # Increased to 60s
-            "socketTimeoutMS": 60000,           # Increased to 60s
-            "maxPoolSize": 50,
-            "minPoolSize": 0,                   # Changed to 0 to avoid immediate connection storm
-            "waitQueueTimeoutMS": 5000,
-            "retryWrites": True,
-            "retryReads": True,
-            "tls": True,
-            "tlsAllowInvalidCertificates": True # Added to bypass SSL handshake errors
-        }
         # Use projection to only fetch required fields for better performance
         projection = {
             "_id": 1,
@@ -672,23 +595,96 @@ async def get_issues(limit: int = 50, skip: int = 0) -> List[Dict[str, Any]]:
             
             authority_name = issue.get("authority_name", ["City Department"])
             if not isinstance(authority_name, list):
-                authority_name = [str(authority_name)] if authority_name else ["City Department"]
+                 authority_name = [str(authority_name)]
             issue["authority_name"] = authority_name
-            
-            # Convert image_id to string if needed
-            if "image_id" in issue and issue["image_id"] and not isinstance(issue["image_id"], str):
-                issue["image_id"] = str(issue["image_id"])
-            
-            issues.append(issue)
-        
-        # Cache the results in Redis for future requests
-        await redis_service.cache_issues_list(issues, limit, skip)
-        
-        logger.info(f"💾 Retrieved {len(issues)} issues from MongoDB and cached (limit: {limit}, skip: {skip})")
+
+            # Format MongoDB ID as string
+            issue["_id"] = str(issue["_id"])
+
         return issues
+        
     except Exception as e:
-        logger.error(f"Failed to retrieve issues: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Failed to retrieve issues: {str(e)}")
+        return []
+
+async def get_user_issues(user_email: str, limit: int = 50, skip: int = 0) -> List[Dict[str, Any]]:
+    """
+    Retrieve issues for a specific user from MongoDB.
+    """
+    try:
+        db = await get_db()
+        LIST_TIMEOUT_MS = int(os.getenv("LIST_TIMEOUT_MS", "5000"))
+        LIST_TIMEOUT_S = max(1.0, LIST_TIMEOUT_MS / 1000.0)
+        
+        projection = {
+            "_id": 1,
+            "issue_type": 1,
+            "description": 1,
+            "address": 1,
+            "zip_code": 1,
+            "latitude": 1,
+            "longitude": 1,
+            "severity": 1,
+            "category": 1,
+            "priority": 1,
+            "user_email": 1,
+            "status": 1,
+            "timestamp": 1,
+            "timestamp_formatted": 1,
+            "timezone_name": 1,
+            "authority_email": 1,
+            "authority_name": 1,
+            "image_id": 1,
+            "decline_reason": 1,
+            "decline_history": 1,
+            "available_authorities": 1
+        }
+        
+        # Filter by user_email
+        pipeline = [
+            {"$match": {"user_email": user_email}},
+            {"$sort": {"timestamp": -1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            {"$project": projection}
+        ]
+
+        async def _run_aggregate_user():
+            cursor = db.issues.aggregate(
+                pipeline,
+                hint="timestamp_desc",
+                maxTimeMS=LIST_TIMEOUT_MS,
+                allowDiskUse=False,
+                batchSize=500
+            )
+            return await cursor.to_list(length=limit)
+
+        try:
+            issues = await asyncio.wait_for(_run_aggregate_user(), timeout=LIST_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            issues = []
+        except Exception as e:
+            logger.error(f"❌ MongoDB user list failed: {str(e)}", exc_info=True)
+            issues = []
+        
+        # Process defaults (same as get_issues)
+        for issue in issues:
+            issue["_id"] = str(issue["_id"])
+            issue.setdefault("issue_type", "Unknown Issue")
+            issue.setdefault("description", "No description")
+            issue.setdefault("address", "Unknown Address")
+            issue.setdefault("zip_code", "N/A")
+            issue.setdefault("severity", "Medium")
+            issue.setdefault("category", "Public")
+            issue.setdefault("priority", "Medium")
+            issue.setdefault("status", "pending")
+            issue.setdefault("timestamp_formatted", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        return issues
+
+    except Exception as e:
+        logger.error(f"Failed to get user issues: {e}")
+        return []
 
 # Legacy function for backward compatibility
 async def get_all_issues() -> List[Dict[str, Any]]:

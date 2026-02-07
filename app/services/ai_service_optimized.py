@@ -42,6 +42,28 @@ async def load_json_data(filename: str) -> dict:
     except Exception as e:
         logger.error(f"Error loading JSON file {filename}: {e}")
         return {}
+
+async def load_prompt_text(filename: str) -> str:
+    """Load prompt text from file with caching"""
+    cache_key = f"prompt_text:{filename}"
+    # Use default TTL of 5 minutes
+    cached = await get_cached_data(cache_key, 300)
+    if cached:
+        return cached
+
+    try:
+        file_path = Path(__file__).parent.parent / "prompts" / filename
+        if file_path.exists():
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            await set_cached_data(cache_key, content, 300)
+            return content
+        else:
+            logger.warning(f"Prompt file not found: {filename}")
+            return ""
+    except Exception as e:
+        logger.error(f"Error loading prompt file {filename}: {e}")
+        return ""
 from utils.location import get_authority_by_zip_code, get_authority
 from utils.timezone import get_timezone_name
 import redis
@@ -92,7 +114,7 @@ CACHE_TTL = {
 _MODEL = None
 
 def get_gemini_model():
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     global _MODEL
     if _MODEL is not None:
         return _MODEL
@@ -100,13 +122,11 @@ def get_gemini_model():
         _MODEL = genai.GenerativeModel(model_name)
         return _MODEL
     except Exception as e:
-        logger.warning(f"{model_name} not available for current API version; attempting fallbacks: {e}")
+        logger.warning(f"{model_name} not available; attempting fallbacks: {e}")
         for alt in [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
+            "gemini-1.5-flash", 
             "gemini-1.5-flash-8b",
             "gemini-1.0-pro-vision",
-            "gemini-1.0-pro"
         ]:
             try:
                 logger.info(f"Trying fallback model: {alt}")
@@ -217,7 +237,7 @@ async def generate_ai_report_async(prompt: str, image_content: bytes, timeout: i
     """Generate AI report asynchronously with timeout control"""
     # Use environment variable for production timeout, fallback to 5 seconds for development
     if timeout is None:
-        timeout = int(os.getenv('AI_TIMEOUT', '8'))
+        timeout = int(os.getenv('AI_TIMEOUT', '25'))
     
     def _generate_report():
         try:
@@ -225,6 +245,11 @@ async def generate_ai_report_async(prompt: str, image_content: bytes, timeout: i
             model = get_gemini_model()
             # Open image in a context manager to avoid resource leaks
             with Image.open(io.BytesIO(image_content)) as img:
+                # OPTIMIZATION: Resize image if too large to speed up upload/processing
+                # 1024px is sufficient for Gemini 1.5 and reduces latency significantly
+                if img.width > 1024 or img.height > 1024:
+                    logger.info(f"Resizing image from {img.size} to max 1024px for speed optimization")
+                    img.thumbnail((1024, 1024))
                 response = model.generate_content([prompt, img])
             return response.text
         except Exception as e:
@@ -279,6 +304,53 @@ async def generate_report_optimized(
 ) -> Dict[str, Any]:
     """Optimized report generation with caching and async processing"""
     
+    # 0. PRE-CHECK: Fast local heuristic to catch obvious garbage/fakes (Professional Gateway)
+    # This prevents wasting AI tokens on 1x1 pixels, solid black images, or extreme aspect ratios.
+    from services.fake_detector_service import detect_fake_or_flag
+    
+    fake_analysis = detect_fake_or_flag(image_content)
+    if fake_analysis["classification"] == "fake":
+        logger.warning(f"⛔ Image rejected by PRE-CHECK heuristic: {fake_analysis}")
+        
+        # Build immediate rejection report
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        return {
+            "issue_overview": {
+                "type": "None",
+                "category": "None",
+                "severity": "low",
+                "summary": "Image rejected: Low quality or invalid format.",
+                "summary_explanation": f"The uploaded image was automatically rejected. Reason: {fake_analysis.get('reason', 'Image quality checks failed')}.",
+                "confidence": 5
+            },
+            "detailed_analysis": {
+                "root_causes": "Image quality insufficient for analysis.",
+                "potential_consequences_if_ignored": "None",
+                "public_safety_risk": "low",
+                "environmental_impact": "low", 
+                "structural_implications": "low",
+                "legal_or_regulatory_considerations": "None",
+                "feedback": "Please upload a clear, real photo of the issue."
+            },
+            "recommended_actions": [],
+            "responsible_authorities_or_parties": [],
+            "available_authorities": [],
+            "ai_evaluation": {
+                "issue_detected": False,
+                "detected_issue_type": "None",
+                "ai_confidence_percent": 0,
+                "image_analysis": f"Heuristic check failed: {fake_analysis.get('reason')}",
+                "rationale": "Pre-screen rejected image as fake or invalid."
+            },
+            "additional_notes": "Auto-rejected by security filter.",
+            "template_fields": {
+                "oid": "REJECTED",
+                "timestamp": timestamp_str,
+                "confidence": 0,
+                "ai_tag": "Invalid Image"
+            }
+        }
+
     # Generate cache key for similar reports
     report_cache_key = generate_cache_key(
         "ai_report",
@@ -380,6 +452,15 @@ async def generate_report_optimized(
     authority_data = None
     responsible_authorities = [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}]
     available_authorities = [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}]
+    
+    # 1. Fetch live authorities for this zip/issue-type EARLY
+    # This ensures they are available for both the AI prompt and the fallback logic.
+    try:
+        auth_data = await get_authority_data_cached(zip_code, address, issue_type, latitude, longitude, category)
+        responsible_authorities = auth_data.get("responsible_authorities", responsible_authorities)
+        available_authorities = auth_data.get("available_authorities", available_authorities)
+    except Exception as e:
+        logger.warning(f"Initial authority fetch failed, using defaults: {e}")
 
     # Department mapping and normalization
     issue_department_map = await get_department_mapping_cached()
@@ -406,103 +487,51 @@ async def generate_report_optimized(
     # Format for prompt (comma separated, Title Case)
     valid_issue_types_str = ", ".join([t.replace("_", " ").title() for t in valid_issue_types_list])
 
-    prompt = f"""
-You are an AI assistant for eaiser AI, generating infrastructure issue reports.
-Analyze the input below and return a structured JSON report (no markdown, no explanation).
-
-Valid Issue Types:
-{valid_issue_types_str}
-
-CRITICAL INSTRUCTION ON REALISM & SAFETY:
-1. FAKE/IRRELEVANT IMAGES:
-   - If the image is a CARTOON, ANIMATION, DRAWING, VIDEO GAME SCREENSHOT, or OBVIOUSLY FAKE/GENERATED:
-     - Set "issue_detected" to false.
-     - Set "detected_issue_type" to "None".
-     - Set "ai_confidence_percent" to 5.
-     - In "image_analysis", explicitly state: "Image appears to be a cartoon, animation, or simulation, not a real-world infrastructure issue."
-   - If the image is unrelated to infrastructure (e.g., a selfie, food, indoor furniture):
-     - Set "issue_detected" to false.
-
-2. FIRES - STRICT CLASSIFICATION:
-   - Distinguish between "Dangerous Fire" (Wildfire, Building Fire, Out of Control) and "Controlled Fire" (Campfire, Bonfire, BBQ, Fire Pit, Religious Ceremony, Burning Leaves, Festival).
-   - If the image shows a SAFE, CONTROLLED fire (e.g., inside a fire pit, people sitting around, BBQ grill, small religious fire, bonfire, burning wood pile, large crowd watching fire, festival celebration):
-     - Classify the Issue Type as "Other" (do NOT use "Fire" or "Wildfire").
-     - Set "issue_detected" to false.
-     - Set "ai_confidence_percent" to 40 (Must be < 50%).
-     - In "image_analysis", explicitly state: "Detected controlled fire/bonfire; not a public safety threat."
-     - In "summary_explanation", use words like "bonfire", "controlled fire", "festival", or "ceremony".
-   - ONLY classify as "Fire" if it poses a threat to public safety (e.g., house on fire, forest burning uncontrolled).
-   - IMPORTANT: If you see people standing calmly near the fire, it is likely a BONFIRE/FESTIVAL. Classify as "Other" (40% confidence).
-
-Input:
-- Issue Type: {issue_type.title()}
-- Severity: {severity}
-- Confidence: {confidence:.1f}%
-- Description: {description}
-- Category: {category}
-- Location: {location_str}
-- Issue ID: {issue_id}
-- Responsible Department: {department}
-- Map Link: {map_link}
-- Priority: {priority}
-{decline_prompt}
-{zip_code_prompt}
-
-For recommended_actions, provide 2-3 specific, actionable steps with timeframes. Examples:
-- Potholes: ["Fill pothole and mark with cones within 48 hours.", "Conduct follow-up inspection after repair."]
-- Broken Streetlight: ["Schedule bulb replacement within 3 days.", "Check wiring and restore power."]
-- Water Leakage: ["Inspect pipeline and stop leakage within 24 hours.", "Fix joints and test pressure."]
-
-Return ONLY JSON with actual values filled in (do NOT use template variables like {{Issue_Type}} - use the actual values I provided above):
-{{
-  "issue_overview": {{
-    "type": "{issue_type.title()}",
-    "severity": "{severity}",
-    "summary_explanation": "Our AI detected a {issue_type} in {location_str}. The image shows {description}. Based on the location and context, this incident has been classified as {priority} due to {category}. Report ID: {report_id}.",
-    "confidence": {confidence:.1f}
-  }},
-  "ai_evaluation": {{
-    "image_analysis": "Describe specifically what visual evidence leads to the conclusion. If NO issue is found, explicitly state what is CLEAN/SAFE (e.g., 'Road surface is smooth/intact', 'No visible trash'). Avoid generic 'No issue found'.",
-    "issue_detected": true|false,
-    "detected_issue_type": "One of the Valid Issue Types listed above or 'None'",
-    "ai_confidence_percent": 0,
-    "rationale": "A single sentence summary justification. E.g., 'Visuals confirm intact infrastructure with no signs of damage'. Use integer for ai_confidence_percent only."
-  }},
-  "detailed_analysis": {{
-    "root_causes": "Possible causes of the issue.",
-    "potential_consequences_if_ignored": "Risks if the issue is not addressed.",
-    "public_safety_risk": "low|medium|high",
-    "environmental_impact": "low|medium|high|none",
-    "structural_implications": "low|medium|high|none",
-    "legal_or_regulatory_considerations": "Relevant regulations or null",
-    "feedback": "User-provided decline reason: {decline_reason}" if decline_reason else null
-  }},
-  "recommended_actions": ["Action 1", "Action 2"],
-  "responsible_authorities_or_parties": {json.dumps(responsible_authorities)},
-  "available_authorities": {json.dumps(available_authorities)},
-  "additional_notes": "Location: {location_str}. View live location: {map_link}. Issue ID: {issue_id}. Track report: https://momentum-ai.org/track/{report_id}. Zip Code: {zip_code if zip_code else 'N/A'}.",
-  "template_fields": {{
-    "oid": "{report_id}",
-    "timestamp": "{local_time}",
-    "utc_time": "{utc_time}",
-    "priority": "{priority}",
-    "tracking_link": "https://momentum-ai.org/track/{report_id}",
-    "image_filename": "{image_filename}",
-    "ai_tag": "{issue_type.title()}",
-    "app_version": "1.5.3",
-    "device_type": "Mobile (Generic)",
-    "map_link": "{map_link}",
-    "zip_code": "{zip_code if zip_code else 'N/A'}",
-    "address": "{address if address else 'Not specified'}",
-    "confidence": {confidence:.1f}
-  }}
-}}
-Keep the report under 200 words, professional, and specific to the issue type and description.
+    prompt_template = await load_prompt_text("generate_report_optimized.txt")
+    if not prompt_template:
+        logger.error("Failed to load prompt template from generate_report_optimized.txt")
+        prompt_template = """
+You are an AI assistant for eaiser AI. Generate a JSON report for the infrastructure issue described.
+Input: {issue_type}, {description}, {location_str}
+Return JSON with issue_overview, detailed_analysis, recommended_actions, etc.
 """
 
+    replacements = {
+        "{valid_issue_types_str}": valid_issue_types_str,
+        "{issue_type_title}": issue_type.title(),
+        "{issue_type}": issue_type,
+        "{severity}": severity,
+        "{confidence_formatted}": f"{confidence:.1f}",
+        "{description}": description,
+        "{category}": category,
+        "{location_str}": location_str,
+        "{issue_id}": issue_id,
+        "{department}": department,
+        "{map_link}": map_link,
+        "{priority}": priority,
+        "{decline_prompt}": f"- Decline Reason: {decline_reason}\n" if decline_reason else "",
+        "{zip_code_prompt}": f"- Zip Code: {zip_code}\n" if zip_code else "",
+        "{report_id}": report_id,
+        "{local_time}": local_time,
+        "{utc_time}": utc_time,
+        "{image_filename}": image_filename,
+        "{zip_code_val}": zip_code if zip_code else "N/A",
+        "{address_val}": display_address,
+        "{responsible_authorities_json}": json.dumps(responsible_authorities),
+        "{available_authorities_json}": json.dumps(available_authorities),
+    }
+
+    if decline_reason:
+        replacements["{feedback_val}"] = json.dumps(f"User-provided decline reason: {decline_reason}")
+    else:
+        replacements["{feedback_val}"] = "null"
+
+    prompt = prompt_template
+    for k, v in replacements.items():
+        prompt = prompt.replace(k, str(v))
+
     try:
-        # Generate AI report with timeout and fetch authorities concurrently
-        authority_task = asyncio.create_task(get_authority_data_cached(zip_code, address, issue_type, latitude, longitude, category))
+        # 2. Generate AI report with timeout
         ai_text = await generate_ai_report_async(prompt, image_content)
         logger.info(f"Gemini optimized report output: {ai_text[:200]}...")
 
@@ -536,10 +565,7 @@ Keep the report under 200 words, professional, and specific to the issue type an
                 "legal_or_regulatory_considerations": "Local regulations may apply.",
                 "feedback": f"User-provided decline reason: {decline_reason}" if decline_reason else None
             })
-            rep.setdefault("recommended_actions", [
-                "Inspect site",
-                "Schedule maintenance"
-            ])
+            rep.setdefault("recommended_actions", [])
             rep.setdefault("responsible_authorities_or_parties", responsible_authorities)
             rep.setdefault("available_authorities", available_authorities)
             rep.setdefault("additional_notes", f"Location: {location_str}. View: {map_link}. Issue ID: {issue_id}. Zip: {zip_code or 'N/A'}.")
@@ -617,23 +643,15 @@ Keep the report under 200 words, professional, and specific to the issue type an
                 ai_conf_val = int(round(float(ai_conf))) if ai_conf is not None else None
             except Exception:
                 ai_conf_val = None
-            if ai_conf_val is not None:
-                overview["confidence"] = ai_conf_val
-            if len(lines) < 6:
-                extras = [
-                    f"Location context: {location_str}.",
-                    f"Issue type: {overview.get('type')}, severity: {severity.lower()}, confidence: {overview.get('confidence', confidence):.0f}%.",
-                    f"Category: {category}.",
-                    f"Potential impact: {report.get('detailed_analysis', {}).get('potential_consequences_if_ignored', 'N/A')}.",
-                    f"Initial action: {', '.join(report.get('recommended_actions', [])[:2]) or 'N/A'}.",
-                    f"Tracking reference: {report.get('template_fields', {}).get('oid', '')}."
-                ]
-                for x in extras:
-                    if len(lines) >= 6:
-                        break
-                    lines.append(x)
-                overview["summary_explanation"] = "\n".join(lines)
-                expl = overview["summary_explanation"]
+            # Enforce minimal summary processing - Do NOT inject repetitive metadata
+            issue_overview = report.get("issue_overview", {})
+            # Ensure summary is present
+            if not issue_overview.get("summary_explanation"):
+                issue_overview["summary_explanation"] = f"Identified {issue_type} based on visual analysis."
+            
+            # Remove legacy "extras" injection that caused repetition
+            # Just trust the AI's output from the updated prompt
+            expl = overview["summary_explanation"]
             overview["summary"] = (expl.split("\n")[0].strip() if "\n" in expl else expl) or f"{overview['type']} reported at {display_address}."
             report["issue_overview"] = overview
             # Normalize ai_evaluation fields with sensible defaults
@@ -679,7 +697,7 @@ Keep the report under 200 words, professional, and specific to the issue type an
                 "people standing","spectators","religious","tradition","custom"
             ]
             minor_words = ["minor","small","tiny","cosmetic","scratch","smudge","dust","stain","normal","benign"]
-            fake_words = ["cartoon", "animation", "drawing", "illustration", "game screenshot", "video game", "simulated", "generated", "fake", "render", "clipart", "sketch", "painting"]
+            fake_words = ["cartoon", "animation", "drawing", "illustration", "game screenshot", "video game", "simulated", "generated", "fake", "render", "clipart", "sketch", "painting", "ai generated", "ai-generated"]
 
             has_danger = any(w in combined for w in danger_words)
             is_controlled = any(w in combined for w in controlled_fire)
@@ -693,6 +711,12 @@ Keep the report under 200 words, professional, and specific to the issue type an
             has_animal = any(w in combined for w in animal_tokens)
             has_accident = any(w in combined for w in accident_tokens)
             has_people = any(w in combined for w in people_tokens)
+
+            # Prevent false positive animal detection if context is negative (e.g. "no animal", "without animal")
+            negative_animal_phrases = ["no animal", "no dead animal", "no stray", "without animal", "not an animal", "no wildlife"]
+            if any(phrase in combined for phrase in negative_animal_phrases):
+                has_animal = False
+
             issue_detected = bool(ai_eval.get("issue_detected"))
             
             # Special check for Fire + People -> likely controlled
@@ -704,7 +728,7 @@ Keep the report under 200 words, professional, and specific to the issue type an
                 issue_detected = False
                 overview["type"] = "None"
                 ai_eval["detected_issue_type"] = "None"
-                ai_eval["image_analysis"] = "Detected as fake/cartoon/animated image."
+                ai_eval["image_analysis"] = "Detected as fake/cartoon/animated/AI-generated image."
                 ai_eval["rationale"] = "Image classified as non-realistic or simulated."
             elif not issue_detected:
                 hazard_tokens = ["hazard","danger","out of control","emergency","injury","uncontrolled","explosion","collapse","severe","major","wildfire","accident","collision","leak","burst"]
@@ -712,18 +736,22 @@ Keep the report under 200 words, professional, and specific to the issue type an
                 new_conf = 40 if not has_hazard else 80
                 issue_detected = bool(has_hazard)
             elif is_controlled and not has_danger:
-                new_conf = 40  # Explicitly set to 40% for bonfires/controlled fires
-                issue_detected = False
-                overview["type"] = "Other"
+                new_conf = 50  # Increased from 40 to 50 to avoid accidental "blurry" rejection
+                issue_detected = True # Treat as detected so it doesn't trigger the "No Issue" check
+                overview["type"] = "Other" # Categorize as Other (not emergency fire)
                 ia = ai_eval.get("image_analysis") or ""
                 if "no public issue" not in ia.lower():
-                    ai_eval["image_analysis"] = "Detected controlled fire/bonfire; not a public safety threat."
+                    ai_eval["image_analysis"] = "Detected controlled fire/bonfire/festival; classified as non-emergency."
             elif is_minor and not has_danger:
                 new_conf = max(75, int(conf_val if conf_val is not None else (ai_eval.get("ai_confidence_percent") or 70)))
+            # Only trigger animal_accident if we are sure it's not excluded by negatives AND we trust the AI didn't pick something else strong
             elif has_animal and has_accident and not any(w in combined for w in ["fire","flame","burning","smoke"]):
-                overview["type"] = "animal_accident"
-                new_conf = max(85, int(conf_val if conf_val is not None else (ai_eval.get("ai_confidence_percent") or 80)))
-                issue_detected = True
+                # If AI already picked specific road damage or something else, only override if confidence is low
+                current_type = (overview.get("type") or "").lower()
+                if current_type not in ["road_damage", "pothole", "abandoned_vehicle"] or new_conf < 70:
+                    overview["type"] = "animal_accident"
+                    new_conf = max(85, int(conf_val if conf_val is not None else (ai_eval.get("ai_confidence_percent") or 80)))
+                    issue_detected = True
             else:
                 # Prefer fallen tree classification if strong cues present
                 tree_tokens = [
@@ -798,19 +826,6 @@ Keep the report under 200 words, professional, and specific to the issue type an
 
         # RE-FETCH AUTHORITIES IF ISSUE TYPE CHANGED
         # This fixes the issue where authority assignment is wrong because it used the initial (potentially wrong) classification.
-        
-        # TICKET 3 IMPLEMENTATION: Authority Recommendation Logic Adjustment
-        # If no issue detected or confidence is low, DO NOT recommend authorities.
-        final_conf = report.get("issue_overview", {}).get("confidence", 0)
-        final_detected = report.get("ai_evaluation", {}).get("issue_detected", False)
-        
-        if not final_detected or final_conf < 50:
-            logger.info(f"Issue {issue_id}: Low confidence ({final_conf}%) or no issue detected. Clearing authorities.")
-            report["responsible_authorities_or_parties"] = []
-            report["available_authorities"] = []
-            # Add guidance advice if purely safety/no-action
-            report["recommended_actions"] = ["No civic authority notification required.", "Ticket closed as 'No Issue Detected'."]
-
         final_issue_type = (report.get("issue_overview", {}).get("type") or issue_type).lower().replace(" ", "_")
         initial_issue_type = issue_type.lower().replace(" ", "_")
         
@@ -925,6 +940,28 @@ Automated report generated via EAiSER AI by MomntumAI
         # Add formatted alert into report dictionary
         report["formatted_report"] = formatted_alert
 
+        # Ticket 3: Authority Recommendation Logic Adjustment
+        # If no issue detected OR confidence is low (<50%), CLEAR authorities
+        ai_eval = report.get("ai_evaluation", {})
+        # Ensure we check the boolean correctly
+        issue_detected_flag = ai_eval.get("issue_detected")
+        if isinstance(issue_detected_flag, str):
+             issue_detected_flag = issue_detected_flag.lower() == 'true'
+        
+        confidence_val = ai_eval.get("ai_confidence_percent", 0)
+
+        if not issue_detected_flag or confidence_val < 50:
+             report["responsible_authorities_or_parties"] = []
+             # report["available_authorities"] = [] # Optional: keep available for manual reassignment if needed
+             
+             # Enrich recommended actions to be helpful to the USER instead of the AUTHORITY
+             report["recommended_actions"] = [
+                 "Review the report details manually.",
+                 "If you believe this is an error, please re-submit with a clearer image.",
+                 "Monitor the situation."
+             ]
+             logger.info(f"Report {issue_id}: Cleared authorities due to Low Confidence/No Issue (Conf: {confidence_val}%, Detected: {issue_detected_flag})")
+
         return report
     except Exception as e:
         # Fallback structured report
@@ -966,10 +1003,7 @@ Automated report generated via EAiSER AI by MomntumAI
                 _ai_confidence_percent = min(_ai_confidence_percent, 50)
         except Exception:
             pass
-        _image_analysis = (
-            f"{_detected_type if _issue_detected else 'No obvious issue detected'}; "
-            f"severity {severity.lower()}, confidence {_ai_confidence_percent}% based on available visual indicators and metadata."
-        )
+        _image_analysis = f"{_detected_type if _issue_detected else 'No obvious issue detected'}."
 
         fallback_report = {
             "issue_overview": {
@@ -977,14 +1011,9 @@ Automated report generated via EAiSER AI by MomntumAI
                 "category": category.title(),
                 "severity": severity,
                 "summary_explanation": (
-                    f"AI Analysis: {_image_analysis}\n"
-                    f"Issue reported at {location_str}.\n"
-                    f"Map context: {map_link}.\n"
-                    f"Zip code context: {zip_code if zip_code else 'N/A'}; coordinates: {latitude}, {longitude}.\n"
-                    f"The issue type is {_detected_type}; severity assessed as {severity.lower()} with {_ai_confidence_percent}% confidence.\n"
-                    f"Visual indicators and metadata support the classification and estimated impact.\n"
-                    f"Initial actions recommended: {actions[0]}{(' ' + actions[1]) if len(actions) > 1 else ''}.\n"
-                    f"Please review and escalate to the appropriate authorities for resolution."
+                    f"A potential {_detected_type.lower()} issue has been identified. "
+                    f"This issue is located at {location_str}. "
+                    f"Our system has assessed the situation with {_ai_confidence_percent}% confidence based on the provided details."
                 ),
                 "confidence": _ai_confidence_percent
             },
@@ -1004,10 +1033,10 @@ Automated report generated via EAiSER AI by MomntumAI
                 "legal_or_regulatory_considerations": "Refer to local regulations.",
                 "feedback": f"User-provided decline reason: {decline_reason}" if decline_reason else None
             },
-            "recommended_actions": actions,
+            "recommended_actions": [],
             "responsible_authorities_or_parties": responsible_authorities,
             "available_authorities": available_authorities,
-            "additional_notes": f"Location: {location_str}. View live location: {map_link}. Issue ID: {issue_id}. Track report: https://momentum-ai.org/track/{report_id}. Zip Code: {zip_code if zip_code else 'N/A'}.",
+            "additional_notes": f"{_detected_type if _issue_detected else 'Issue'} identified at {location_str}. View live location: {map_link}. Issue ID: {issue_id}. Track report: https://eaiser.ai/track/{report_id}.",
             "template_fields": {
                 "oid": report_id,
                 "timestamp": local_time,

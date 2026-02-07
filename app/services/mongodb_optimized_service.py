@@ -87,6 +87,7 @@ class OptimizedMongoDBService:
         self.read_client: Optional[AsyncIOMotorClient] = None
         self.db: Optional[AsyncIOMotorDatabase] = None
         self.read_db: Optional[AsyncIOMotorDatabase] = None
+        self.fs: Optional[motor.motor_asyncio.AsyncIOMotorGridFSBucket] = None
         
         # Circuit breakers
         self.write_circuit_breaker = MongoDBCircuitBreaker()
@@ -113,15 +114,15 @@ class OptimizedMongoDBService:
         # Index definitions for optimal query performance
         self.index_definitions = {
             'issues': [
-                IndexModel([('status', ASCENDING), ('timestamp', DESCENDING)]),
-                IndexModel([('zip_code', ASCENDING), ('status', ASCENDING)]),
-                IndexModel([('latitude', ASCENDING), ('longitude', ASCENDING)]),
-                IndexModel([('issue_type', ASCENDING), ('severity', ASCENDING)]),
-                IndexModel([('user_email', ASCENDING)]),
-                IndexModel([('timestamp', DESCENDING)]),
-                IndexModel([('report_id', ASCENDING)]),
-                IndexModel([('category', ASCENDING), ('priority', ASCENDING)]),
-                IndexModel([('address', TEXT), ('issue_type', TEXT)]),  # Text search
+                IndexModel([('status', ASCENDING), ('timestamp', DESCENDING)], name='status_timestamp'),
+                IndexModel([('zip_code', ASCENDING), ('status', ASCENDING)], name='zip_code_status'),
+                IndexModel([('latitude', ASCENDING), ('longitude', ASCENDING)], name='lat_lon'),
+                IndexModel([('issue_type', ASCENDING), ('severity', ASCENDING)], name='issue_type_severity'),
+                IndexModel([('user_email', ASCENDING)], name='user_email'),
+                IndexModel([('timestamp', DESCENDING)], name='timestamp_desc'),
+                IndexModel([('report_id', ASCENDING)], name='report_id'),
+                IndexModel([('category', ASCENDING), ('priority', ASCENDING)], name='category_priority'),
+                IndexModel([('address', TEXT), ('issue_type', TEXT)], name='address_issue_type_text'),
             ],
             'users': [
                 IndexModel([('email', ASCENDING)], unique=True),
@@ -162,11 +163,11 @@ class OptimizedMongoDBService:
                 # Primary client for writes (with safe options)
                 self.primary_client = AsyncIOMotorClient(
                     self.mongo_uri,
-                    serverSelectionTimeoutMS=30000,  # Increased to 30s
+                    serverSelectionTimeoutMS=30000,
                     connectTimeoutMS=30000,
                     socketTimeoutMS=30000,
-                    maxPoolSize=50,                  # Reduced from 200
-                    minPoolSize=1,                   # Reduced from 20 to prevent handshake floods
+                    maxPoolSize=20,                  # Reduced for stability
+                    minPoolSize=0,                   # Reduced to 0 to avoid startup hang
                     maxIdleTimeMS=30000,
                     waitQueueTimeoutMS=10000,
                     retryWrites=True,
@@ -176,11 +177,11 @@ class OptimizedMongoDBService:
                 # Secondary client for reads (prefer secondary)
                 self.read_client = AsyncIOMotorClient(
                     self.mongo_uri,
-                    serverSelectionTimeoutMS=30000,  # Increased to 30s
+                    serverSelectionTimeoutMS=30000,
                     connectTimeoutMS=30000,
                     socketTimeoutMS=30000,
-                    maxPoolSize=50,                  # Reduced from 300
-                    minPoolSize=1,                   # Reduced from 30
+                    maxPoolSize=20,                  # Reduced for stability
+                    minPoolSize=0,                   # Reduced to 0 to avoid startup hang
                     maxIdleTimeMS=45000,
                     waitQueueTimeoutMS=10000,
                     compressors=['zlib'],
@@ -194,6 +195,9 @@ class OptimizedMongoDBService:
                 # Initialize databases
                 self.db = self.primary_client[self.db_name]
                 self.read_db = self.read_client[self.db_name]
+                
+                # Initialize GridFS
+                self.fs = motor.motor_asyncio.AsyncIOMotorGridFSBucket(self.db)
                 
                 # Create indexes for optimal performance
                 await self._create_indexes()
@@ -235,20 +239,21 @@ class OptimizedMongoDBService:
             for collection_name, indexes in self.index_definitions.items():
                 collection = self.db[collection_name]
                 
-                # Create indexes (non-blocking by default in MongoDB 4.2+)
-                await collection.create_indexes(indexes)
-                
-                logger.info(f"📊 Created {len(indexes)} indexes for {collection_name} collection")
+                try:
+                    # Create indexes (background option removed as it's deprecated/unsupported in newer Mongo versions)
+                    await collection.create_indexes(indexes)
+                    logger.info(f"📊 Created {len(indexes)} indexes for {collection_name} collection")
+                except Exception as e:
+                    # Handle IndexOptionsConflict (Code 85) - Index exists with different name/options
+                    if "IndexOptionsConflict" in str(e) or "already exists" in str(e) or getattr(e, "code", 0) == 85:
+                         logger.info(f"ℹ️ indexes for '{collection_name}' already exist (skipping update).")
+                    else:
+                        logger.error(f"❌ Failed to create indexes for {collection_name}: {str(e)}")
             
-            logger.info("✅ All database indexes created successfully")
+            logger.info("✅ All database indexes created/verified")
             
         except Exception as e:
-            # Ignore IndexOptionsConflict (code 85) - likely existing index with different options
-            if hasattr(e, 'code') and e.code == 85:
-                # Log as warning but don't fail startup
-                logger.warning(f"⚠️ Index conflict ignored in optimized service (likely pre-existing): {str(e)}")
-            else:
-                logger.error(f"❌ Failed to create indexes: {str(e)}")
+            logger.error(f"❌ Failed to create indexes: {str(e)}")
     
     @asynccontextmanager
     async def _safe_operation(self, operation_type='read'):
@@ -625,6 +630,14 @@ class OptimizedMongoDBService:
                 # Motor supports max_time_ms in find_one kwargs
                 issue_data = await collection.find_one({"_id": issue_id}, max_time_ms=3000)
                 
+                # Fallback to ObjectId if string search fails (handles legacy/mixed data)
+                if not issue_data:
+                    try:
+                        from bson.objectid import ObjectId
+                        issue_data = await collection.find_one({"_id": ObjectId(issue_id)}, max_time_ms=3000)
+                    except Exception:
+                        pass
+                
                 if issue_data:
                     # Convert ObjectId to string for JSON serialization
                     if '_id' in issue_data:
@@ -767,15 +780,26 @@ class OptimizedMongoDBService:
             issue_id = await self.insert_one_optimized('issues', issue_doc)
             
             # Store image in GridFS if provided
-            if image_content:
+            if image_content and self.fs:
                 try:
-                    # This would typically use GridFS for large images
-                    # For now, we'll store a reference to the image
+                    # Optimized image storage using GridFS
+                    image_id = await self.fs.upload_from_stream(
+                        filename=f"{issue_doc['_id']}.jpg",
+                        source=image_content,
+                        metadata={"issue_id": issue_doc['_id']}
+                    )
+                    
+                    # Update issue document with image_id
                     await self.update_one_optimized(
                         'issues',
                         {"_id": issue_doc['_id']},
-                        {"$set": {"image_stored": True, "image_size": len(image_content)}}
+                        {"$set": {
+                            "image_id": str(image_id),
+                            "image_stored": True, 
+                            "image_size": len(image_content)
+                        }}
                     )
+                    logger.info(f"📸 Image stored in GridFS for issue {issue_doc['_id']} with ID {image_id}")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to store image for issue {issue_doc['_id']}: {e}")
             
@@ -785,6 +809,32 @@ class OptimizedMongoDBService:
         except Exception as e:
             logger.error(f"❌ Failed to store issue: {str(e)}")
             raise e
+    
+    async def get_issue_image_stream(self, issue_id: str):
+        """
+        Retrieve image content stream from GridFS by issue ID.
+        """
+        try:
+            async with self._safe_operation('read'):
+                collection = await self.get_collection('issues', read_only=True)
+                issue = await collection.find_one({"_id": issue_id})
+                
+                if not issue or not issue.get('image_id'):
+                    return None
+                
+                if not self.fs:
+                    return None
+                    
+                image_id = issue['image_id']
+                try:
+                    gridout = await self.fs.open_download_stream(ObjectId(image_id))
+                    return gridout
+                except Exception as e:
+                    logger.error(f"❌ Failed to open download stream for image {image_id}: {e}")
+                    return None
+        except Exception as e:
+            logger.error(f"❌ Error retrieving image stream for issue {issue_id}: {e}")
+            return None
     
     async def get_analytics_summary(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
         """
@@ -817,12 +867,12 @@ class OptimizedMongoDBService:
                             "total_issues": {"$sum": 1},
                             "open_issues": {
                                 "$sum": {
-                                    "$cond": [{"$eq": ["$status", "pending"]}, 1, 0]
+                                    "$cond": [{"$in": ["$status", ["pending", "needs_review", "submitted", "under_review"]]}, 1, 0]
                                 }
                             },
                             "resolved_issues": {
                                 "$sum": {
-                                    "$cond": [{"$eq": ["$status", "resolved"]}, 1, 0]
+                                    "$cond": [{"$in": ["$status", ["resolved", "completed", "accepted", "rejected", "declined"]]}, 1, 0]
                                 }
                             }
                         }

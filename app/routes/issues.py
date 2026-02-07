@@ -1,14 +1,18 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from services.ai_service import classify_issue
 from services.ai_service_optimized import generate_report_optimized as generate_report
 from services.email_service import send_email
-from services.mongodb_service import store_issue, get_issues, update_issue_status, get_db, get_fs
+from services.mongodb_service import store_issue, get_issues, get_user_issues, update_issue_status, get_db, get_fs
 from services.geocode_service import reverse_geocode, geocode_zip_code
 from services.report_generation_service import build_unified_issue_json
 from utils.location import get_authority, get_authority_by_zip_code
 from utils.timezone import get_timezone_name
+from utils.security import SECRET_KEY, ALGORITHM
+from jose import jwt, JWTError
+from services.authority_service import resolve_authorities
 from bson.objectid import ObjectId
 import uuid
 import logging
@@ -19,6 +23,8 @@ import pytz
 from typing import List, Optional, Dict, Any
 import gridfs.errors
 import asyncio
+from PIL import Image
+import io
 
 # Setup optimized logging
 logging.basicConfig(
@@ -28,10 +34,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Set AI service logger to DEBUG to debug hanging issues
-logging.getLogger("app.services.ai_service").setLevel(logging.DEBUG)
-logging.getLogger("app.services.geocode_service").setLevel(logging.INFO)
+# Set AI service logger to WARNING to reduce noise
+logging.getLogger("app.services.ai_service").setLevel(logging.WARNING)
+logging.getLogger("app.services.geocode_service").setLevel(logging.WARNING)
 router = APIRouter()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        return {"sub": email, "id": payload.get("id"), "role": payload.get("role")}
+    except JWTError:
+        raise credentials_exception
+
+@router.get("/issues/my-issues")
+async def get_my_issues(current_user: dict = Depends(get_current_user)):
+    """Get issues reported by the current user."""
+    return await get_user_issues(current_user.get("sub"))
 
 class IssueResponse(BaseModel):
     id: str
@@ -180,7 +208,6 @@ Fire Department Action Required:
 • GPS: {latitude if latitude else 'N/A'}, {longitude if longitude else 'N/A'}
 • Live Location: {map_link}
 • Severity: {severity_checkboxes}
-• Recommended Action: Immediate inspection and fire suppression measures.
 • Report ID: {report.get('template_fields', {}).get('oid', 'N/A')}
 Photo Evidence:
 • File: {report.get('template_fields', {}).get('image_filename', 'N/A')}
@@ -203,7 +230,6 @@ Police Action Required:
 • GPS: {latitude if latitude else 'N/A'}, {longitude if longitude else 'N/A'}
 • Live Location: {map_link}
 • Severity: {severity_checkboxes}
-• Recommended Action: Deploy officers to investigate and secure the area.
 • Report ID: {report.get('template_fields', {}).get('oid', 'N/A')}
 Photo Evidence:
 • File: {report.get('template_fields', {}).get('image_filename', 'N/A')}
@@ -226,7 +252,6 @@ Public Works Action Required:
 • GPS: {latitude if latitude else 'N/A'}, {longitude if longitude else 'N/A'}
 • Live Location: {map_link}
 • Severity: {severity_checkboxes}
-• Recommended Action: Schedule maintenance and repair work.
 • Report ID: {report.get('template_fields', {}).get('oid', 'N/A')}
 Photo Evidence:
 • File: {report.get('template_fields', {}).get('image_filename', 'N/A')}
@@ -249,7 +274,6 @@ Action Required:
 • GPS: {latitude if latitude else 'N/A'}, {longitude if longitude else 'N/A'}
 • Live Location: {map_link}
 • Severity: {severity_checkboxes}
-• Recommended Action: Inspect and address issue promptly.
 • Report ID: {report.get('template_fields', {}).get('oid', 'N/A')}
 Photo Evidence:
 • File: {report.get('template_fields', {}).get('image_filename', 'N/A')}
@@ -282,9 +306,6 @@ async def send_authority_email(
     decline_reason: Optional[str] = None,
     is_user_review: bool = False
 ) -> bool:
-    logger.info(f"📧 send_authority_email called for issue {issue_id}")
-    logger.info(f"📧 Authorities: {authorities}")
-
     if not authorities:
         logger.warning("No authorities provided, using default")
         authorities = [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}]
@@ -709,12 +730,10 @@ async def send_authority_email(
     </p>
 
     <p><span class="label">Priority:</span>
-      {report.get('issue_overview', {}).get('severity_label', 'N/A')}
+       {report.get('issue_overview', {}).get('severity_label', 'N/A')}
     </p>
 
     <p><span class="label">Reported:</span> {timestamp_formatted}</p>
-
-    <p><span class="label">Submitted By:</span> {report.get('user_email','N/A')}</p>
   </div>
 
   <!-- IMAGE -->
@@ -779,9 +798,6 @@ async def send_authority_email(
     
     for authority in authorities:
         try:
-            target_email = authority.get("email", "eaiser@momntumai.com")
-            logger.info(f"📧 Attempting to send email to {target_email} ({authority.get('type', 'general')})")
-            
             subject, text_content = get_department_email_content(
                 authority.get("type", "general"),
                 {
@@ -800,26 +816,24 @@ async def send_authority_email(
                 },
                 is_user_review=is_user_review
             )
-            # logger.debug(f"Sending email to [redacted] for {authority.get('type', 'general')} with subject: {subject}") 
-            
+            logger.debug(f"Sending email to [redacted] for {authority.get('type', 'general')} with subject: {subject}")
             success = await send_email(
-                to_email=target_email,
+                to_email=authority.get("email", "eaiser@momntumai.com"),
                 subject=subject_override or subject,
                 html_content=html_content,
                 text_content=text_content,
                 attachments=None,
                 embedded_images=embedded_images
             )
-            
             if success:
-                successful_emails.append(target_email)
-                logger.info(f"✅ Email sent successfully to {target_email}")
+                successful_emails.append(authority.get("email", "eaiser@momntumai.com"))
+                logger.info(f"Email sent successfully to [redacted] for {authority.get('type', 'general')}")
             else:
-                logger.error(f"❌ Email sending failed for {target_email} (send_email returned False)")
-                errors.append(f"Email sending failed for {target_email}")
+                logger.warning(f"Email sending failed for [redacted] without raising an exception")
+                errors.append(f"Email sending failed for {authority.get('email', 'eaiser@momntumai.com')}")
         except Exception as e:
-            logger.error(f"❌ Exception sending email to {authority.get('email')}: {str(e)}", exc_info=True)
-            errors.append(f"Failed to send email to {authority.get('email')}: {str(e)}")
+            logger.error(f"Failed to send email to [redacted]: {str(e)}", exc_info=True)
+            errors.append(f"Failed to send email to {authority.get('email', 'eaiser@momntumai.com')}: {str(e)}")
     
     try:
         db = await get_db()
@@ -846,7 +860,7 @@ async def send_authority_email(
 
 @router.post("/issues", response_model=IssueResponse)
 async def create_issue(
-    image: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),  # Image is now OPTIONAL
     description: str = Form(''),
     address: str = Form(''),
     zip_code: Optional[str] = Form(None),
@@ -854,56 +868,157 @@ async def create_issue(
     longitude: float = Form(0.0),
     user_email: Optional[str] = Form(None),
     category: str = Form('public'),
+    
     severity: str = Form('medium'),
     issue_type: str = Form('other')
 ):
-    logger.debug(f"Creating issue with address: {address}, zip: {zip_code}, lat: {latitude}, lon: {longitude}, user_email: [redacted]")
+    logger.debug(f"Creating issue with address: {address}, zip: {zip_code}, lat: {latitude}, lon: {longitude}")
     try:
         db = await get_db()
         fs = await get_fs()
-        logger.debug("Database and GridFS initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database initialization failed: {str(e)}")
     
+    # -------------------------------------------------------------
+    # 1. MANUAL REPORT FLOW (No Image)
+    # -------------------------------------------------------------
+    if image is None:
+        logger.info("📝 Processing MANUAL REPORT (No Image Provided)")
+        
+        issue_id = str(uuid.uuid4())
+        
+        # Enforce "Unknown/Manual" state so user must fill it
+        final_address = address
+        if not final_address and latitude and longitude:
+             try:
+                geocode_result = await reverse_geocode(latitude, longitude)
+                final_address = geocode_result.get("address", "Unknown Address")
+                if not zip_code:
+                     zip_code = geocode_result.get("zip_code")
+             except:
+                final_address = "Unknown Address"
+
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        
+        # Construct a "Blank" Report for Manual Entry
+        manual_report = {
+            "issue_overview": {
+                "issue_type": issue_type if issue_type != 'other' else "Manual Report",
+                "category": category,
+                "severity": severity or "medium",
+                "summary_explanation": description or "Manual report submitted by user.",
+                "confidence": 0,  # 0 Confidence -> Triggers "Manual Mode" in UI
+                "location_context": "Manual Entry"
+            },
+            "detailed_analysis": {
+                "root_causes": "Manual Report",
+                "public_safety_risk": "Unknown",
+                "potential_consequences_if_ignored": "Unknown",
+                "environmental_impact": "Unknown",
+                "structural_implications": "Unknown",
+                "legal_or_regulatory_considerations": "None",
+                "feedback": "None"
+            },
+            "recommended_actions": ["Review Details", "Assign Authority"],
+            "responsible_authorities_or_parties": [], # Empty -> User must select
+            "available_authorities": [],
+            "ai_evaluation": {
+                "issue_detected": True,
+                "detected_issue_type": "Manual",
+                "ai_confidence_percent": 0,
+                "image_analysis": "No image provided.",
+                "rationale": "User opted for manual reporting."
+            },
+            "template_fields": {
+                "oid": issue_id,
+                "timestamp": timestamp_str,
+                "confidence": 0,
+                "ai_tag": "Manual",
+                "address": final_address,
+                "priority": "Medium",
+                "image_filename": "No Image"
+            }
+        }
+        
+        # We DO NOT save to DB yet. We return it as a "Preview" for the user to edit/confirm.
+        # But we need an ID to submit later.
+        # Ideally, we save a draft or just user sends it back. 
+        # The frontend expects 'id' and 'report'.
+        # We will save a placeholder 'pending_manual' issue to allow 'submit' to work?
+        # Actually 'submit_issue' expects an existing issue in DB.
+        # So we MUST save this initial shell to DB.
+        
+        # Save to DB (Status: draft/pending)
+        await store_issue(
+             db,
+             fs,
+             issue_id,
+             b'', # Empty image content
+             manual_report,
+             {}, # unified_report
+             final_address,
+             zip_code,
+             latitude,
+             longitude,
+             manual_report['issue_overview']['issue_type'],
+             manual_report['issue_overview']['severity'],
+             "General", # category
+             "Medium", # priority
+             user_email,
+             [], # responsible_authorities
+             [] # available_authorities
+        )
+        
+        return IssueResponse(
+            id=issue_id,
+            message="Manual draft created. Please fill in details.",
+            report={
+                 "report": manual_report,
+                 "id": issue_id
+            }
+        )
+
+    # -------------------------------------------------------------
+    # 2. STANDARD AI FLOW (With Image)
+    # -------------------------------------------------------------
     if not image.content_type.startswith("image/"):
         logger.error(f"Invalid image format: {image.content_type}")
         raise HTTPException(status_code=400, detail="Invalid image format")
     
     try:
         image_content = await image.read()
-        original_size = len(image_content)
+        logger.debug(f"Image read successfully, size: {len(image_content)} bytes")
         
-        # --- RESIZE IMAGE OPTIMIZATION ---
+        # Performance: Resize/Optimize image before processing
         try:
-            from PIL import Image
-            import io
-            img = Image.open(io.BytesIO(image_content))
-            # Resize if significantly larger than 1024x1024
-            if img.width > 1200 or img.height > 1200:
-                img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                # Use JPEG for efficiency if original was large
-                save_format = img.format if img.format else 'JPEG'
-                if save_format == 'PNG':
-                    # Convert RGBA to RGB if needed for JPEG
-                    if img.mode == 'RGBA':
-                        img = img.convert('RGB')
-                    save_format = 'JPEG' # Force JPEG for Mobile Photos (Compression)
+            with Image.open(io.BytesIO(image_content)) as img:
+                # Resize if larger than 1024x1024
+                if img.width > 1024 or img.height > 1024:
+                    img.thumbnail((1024, 1024))
                 
-                img.save(buf, format=save_format, quality=85)
-                image_content = buf.getvalue()
-                logger.info(f"📉 Resized Image: {original_size} -> {len(image_content)} bytes")
-        except Exception as resize_err:
-            logger.warning(f"⚠️ Image resize failed, using original: {resize_err}")
-        # ---------------------------------
+                # Convert to RGB (standardize)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Compress to JPEG
+                output = io.BytesIO()
+                img.save(output, format='JPEG', quality=85, optimize=True)
+                new_content = output.getvalue()
+                
+                # Only use new content if it's actually smaller or we resized
+                if len(new_content) < len(image_content):
+                    image_content = new_content
+                    logger.info(f"⚡ Image optimized: {len(image_content)} bytes")
+        except Exception as e:
+            logger.warning(f"⚠️ Image optimization failed (using original): {e}")
 
-        logger.debug(f"Image read/processed successfully, final size: {len(image_content)} bytes")
     except Exception as e:
         logger.error(f"Failed to read image: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to read image: {str(e)}")
     
     try:
+        # Pass reduced image to initial classifier
         issue_type, severity, confidence, category, priority = await classify_issue(image_content, description or "")
         if not issue_type:
             logger.error("Failed to classify issue type")
@@ -959,33 +1074,88 @@ async def create_issue(
             tf["address"] = final_address or "Not specified"
         report["template_fields"] = tf
         
+        # --- VALIDATE REPORT QUALITY (TRIGGER ALERTS) ---
+        ai_eval = report.get("ai_evaluation", {})
+        issue_overview = report.get("issue_overview", {})
+        
+        # 1. Check for Fake/Simulated Image
+        # The AI, in 'generate_report_optimized', sets 'issue_detected'=False and type='None' for fake images
+        is_issue_detected = ai_eval.get("issue_detected")
+        detected_type = str(issue_overview.get("type", "")).lower()
+        confidence_val = issue_overview.get("confidence", 0)
+        
+        # Conditions for rejection:
+        # A. Explicitly detected as fake (confidence usually forced to ~5)
+        if "fake" in str(ai_eval.get("image_analysis", "")).lower() or \
+           "simulated" in str(ai_eval.get("rationale", "")).lower():
+            logger.warning(f"🚫 Rejected fake image analysis for issue {issue_id}")
+            raise HTTPException(status_code=400, detail="Analysis failed: This image appears to be AI-generated or manipulated.")
+
+        # B. Confidence too low (Blurry or Irrelevant)
+        if confidence_val < 5: 
+            logger.warning(f"🚫 Rejected extremely low confidence report ({confidence_val}%) for issue {issue_id}")
+            raise HTTPException(status_code=400, detail="Analysis failed: The image is too blurry, dark, or unclear to analyze.")
+            
+        # C. No issue detected
+        logger.info(f"Validation Check: type='{detected_type}', detected={is_issue_detected}, conf={confidence_val}")
+        
+        # C. No issue detected - Relaxed check (< 30 instead of < 45)
+        if is_issue_detected is False and confidence_val < 30:
+             # Allow "Other" if confidence is decent, but reject "None"
+             if detected_type in ["none", ""]:
+                 raise HTTPException(status_code=400, detail="Analysis failed: No valid infrastructure issue detected in this image.")
+
         recommended_actions = report.get("recommended_actions", [])
         if "recommended_actions" not in report:
             report["recommended_actions"] = recommended_actions
         
         logger.debug(f"Report generated for issue {issue_id}")
+    except HTTPException:
+        raise # Re-raise HTTP exceptions directly
     except Exception as e:
         logger.error(f"Failed to generate report for issue {issue_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
     
     try:
-        authority_data = get_authority_by_zip_code(zip_code, issue_type, category) if zip_code else get_authority(final_address, issue_type, latitude, longitude, category)
-        responsible_authorities = authority_data.get("responsible_authorities", [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}])
-        available_authorities = authority_data.get("available_authorities", [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}])
+        # Resolve authorities using the new service
+        # Extract context from the generated report
+        ai_json_context = report.get("issue_overview", {})
+        if not ai_json_context:
+             # Fallback context if report structure is different
+             ai_json_context = {
+                 "case_id": issue_id,
+                 "description": description,
+                 "confidence": confidence,
+                 "summary_explanation": description
+             }
+        else:
+             ai_json_context["case_id"] = issue_id
+             ai_json_context["confidence"] = confidence
+
+        authority_result = await resolve_authorities(issue_type, zip_code, ai_json_context)
         
-        responsible_authorities = [
-            {**{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}, **auth}
-            for auth in responsible_authorities
-        ]
-        available_authorities = [
-            {**{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}, **auth}
-            for auth in available_authorities
-        ]
+        resolved_auths = authority_result["authorities"]
+        
+        # Consolidate to responsible_authorities
+        responsible_authorities = []
+        if resolved_auths:
+            responsible_authorities = [
+                {**{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}, **auth}
+                for auth in resolved_auths
+            ]
+        else:
+             logger.warning(f"No authorities resolved for {issue_type} in {zip_code}")
+             responsible_authorities = [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}]
+
+        available_authorities = responsible_authorities
 
         authority_emails = [auth["email"] for auth in responsible_authorities]
         authority_names = [auth["name"] for auth in responsible_authorities]
-        logger.debug(f"Responsible authorities fetched: {authority_emails}")
-        logger.debug(f"Available authorities fetched: {[auth['email'] for auth in available_authorities]}")
+        
+        logger.info(f"Authorities resolved: {len(responsible_authorities)} found. Mapped: {authority_result.get('is_mapped')}")
+        if not authority_result.get('is_mapped'):
+             logger.info(f"⚠️ Issue unmapped. Review entry created: {authority_result.get('mapping_review', {}).get('id')}")
+
     except Exception as e:
         logger.warning(f"Failed to fetch authorities: {str(e)}. Using default authority.", exc_info=True)
         responsible_authorities = [{"name": "City Department", "email": "eaiser@momntumai.com", "type": "general"}]
@@ -1200,25 +1370,6 @@ async def create_issue(
     except Exception as e:
         logger.error(f"Failed to send initial review email for issue {issue_id}: {str(e)}", exc_info=True)
     
-    try:
-        from services.socket_manager import manager
-        await manager.broadcast({
-            "event": "new_issue",
-            "issue": {
-                "_id": issue_id,
-                "issue_type": issue_type,
-                "address": final_address,
-                "status": issue_status,
-                "severity": severity,
-                "timestamp": timestamp,
-                "lat": latitude,
-                "lng": longitude
-            }
-        })
-        logger.info(f"📡 Broadcasted new issue {issue_id} to WebSockets")
-    except Exception as ws_e:
-        logger.warning(f"WebSocket broadcast failed: {ws_e}")
-    
     return IssueResponse(
         id=issue_id,
         message="Please review the generated report and select responsible authorities",
@@ -1308,81 +1459,87 @@ async def submit_issue(issue_id: str, request: SubmitRequest):
 
     # Enforce guard decision: block low confidence or policy conflicts
     # FAIL SAFE LOGIC
-    needs_review = False
+    # Calculate confidence first to guide decision
+    conf_val = 0.0
     try:
-        decision_action = issue.get("dispatch_decision")
-        if decision_action == "reject":
-             logger.info(f"Issue {issue_id} auto-rejected/screened-out. Routing to Admin Review.")
-             needs_review = True
-        
-        # Calculate confidence regardless to populate fields
-        conf_val = 0.0
-        try:
-            conf_candidates = [
-                report.get("template_fields", {}).get("confidence"),
-                report.get("unified_report", {}).get("confidence"),
-                report.get("issue_overview", {}).get("confidence"),
-            ]
-            # Collect all valid confidence scores
-            valid_scores = []
-            for c in conf_candidates:
-                if c is None: continue
-                try:
-                    s = str(c).strip()
-                    if s.endswith('%'): s = s[:-1]
-                    v = float(s)
-                    if v <= 1.0: v = v * 100.0
-                    v = max(0.0, min(100.0, v))
-                    valid_scores.append(v)
-                except Exception: continue
-            
-            if valid_scores:
-                conf_val = min(valid_scores)
-            else:
-                conf_val = 0.0
-
-        except Exception as e:
-            logger.error(f"DEBUG: Confidence parsing error: {e}")
-            conf_val = 0.0
-
-        # Strict user rule: Confidence based routing + Restricted Categories
-        # If < 70 -> Admin Review
-        # If Category is in [other, none, unknown, controlled_fire, bonfire, etc] -> Admin Review
-        # Else (High Confidence + Valid Category) -> Auto Send immediately
-        
-        current_issue_type = report.get("issue_type") or issue.get("issue_type", "unknown")
-        current_issue_type = str(current_issue_type).lower()
-        
-        # Categories that ALWAYS require human verification regardless of confidence
-        restricted_categories = [
-            "other", "none", "unknown",
-            "controlled_fire", "bonfire", "campfire", "burning_leaves",
-            "festival", "ceremony", "bbq", "barbecue"
+        # Try to get confidence from multiple sources in order of preference
+        conf_candidates = [
+            request.edited_report.get('issue_overview', {}).get('confidence') if request.edited_report else None,
+            report.get("template_fields", {}).get("confidence"),
+            report.get("unified_report", {}).get("confidence"),
+            report.get("issue_overview", {}).get("confidence"),
+            issue.get("report", {}).get("issue_overview", {}).get("confidence")
         ]
         
-        # Check partial matches for fire-related terms that imply controlled burning
-        is_restricted = (
-            current_issue_type in restricted_categories or
-            any(x in current_issue_type for x in ["control", "bonfire", "campfire"])
-        )
+        # Collect all valid confidence scores
+        valid_scores = []
+        for c in conf_candidates:
+            if c is None: continue
+            try:
+                s = str(c).strip()
+                if s.endswith('%'): s = s[:-1]
+                v = float(s)
+                if v <= 1.0: v = v * 100.0
+                v = max(0.0, min(100.0, v))
+                valid_scores.append(v)
+            except Exception: continue
         
-        if conf_val < 70 or is_restricted:
-            reason = []
-            if conf_val < 70: reason.append(f"Low Confidence ({conf_val}%)")
-            if is_restricted: reason.append(f"Restricted Category '{current_issue_type}'")
-            
-            logger.info(f"🚨 Issue {issue_id} flagged for admin review. Reason: {', '.join(reason)}")
-            needs_review = True
+        # Use the highest found confidence to be permissive, or min if we want to be conservative? 
+        # User wants High Confidence -> Auto Send. Let's use the explicit value found.
+        # Usually these should align. let's take the first valid one we found (priority order).
+        if valid_scores:
+            conf_val = valid_scores[0] # Priority: Edited > Template > Unified > Overview
         else:
-            logger.info(f"✅ Issue {issue_id} passed review checks (Conf={conf_val}%, Type={current_issue_type}). Auto-sending.")
-            needs_review = False
+            conf_val = 0.0
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Guard logic exception for {issue_id}: {e}", exc_info=True)
-        # Fail Closed -> Review
+        logger.error(f"DEBUG: Confidence parsing error: {e}")
+        conf_val = 0.0
+
+    # Determine Issue Type
+    current_issue_type = report.get("issue_type") or issue.get("issue_type", "unknown")
+    current_issue_type = str(current_issue_type).lower().strip()
+
+    # Restricted Categories that ALWAYS require review
+    restricted_categories = [
+        "other", "none", "unknown",
+        "controlled_fire", "bonfire", "campfire", "burning_leaves",
+        "festival", "ceremony", "bbq", "barbecue",
+        "fake", "ai_generated", "cartoon", "animated", "illustration", "art", "drawing", "video_game"
+    ]
+    
+    # Check for restricted types (Exact match or Safe substring)
+    # We explicitly exclude "uncontrolled" from matching "controlled" logic
+    is_restricted = False
+    if current_issue_type in restricted_categories:
+        is_restricted = True
+    else:
+        # Substring checks
+        # Fire/Controlled checks
+        if "bonfire" in current_issue_type or "campfire" in current_issue_type:
+            is_restricted = True
+        elif "control" in current_issue_type and "uncontrolled" not in current_issue_type:
+            is_restricted = True
+        
+        # Artificial/Fake checks
+        artificial_terms = ["fake", "ai generated", "cartoon", "animated", "illustration", "drawing"]
+        if any(term in current_issue_type for term in artificial_terms):
+            is_restricted = True
+
+    # DECISION LOGIC
+    # 1. If restricted category -> Review
+    # 2. If confidence < 70 -> Review
+    # 3. Otherwise -> Auto Send
+    
+    if is_restricted:
+        logger.info(f"🚨 Issue {issue_id} flagged for review (Restricted Category: '{current_issue_type}')")
         needs_review = True
+    elif conf_val < 70:
+        logger.info(f"🚨 Issue {issue_id} flagged for review (Low Confidence: {conf_val}%)")
+        needs_review = True
+    else:
+        logger.info(f"✅ Issue {issue_id} passed review checks (Conf={conf_val}%, Type={current_issue_type}). Auto-sending.")
+        needs_review = False
 
     if needs_review:
         # Save state and return
@@ -1474,54 +1631,6 @@ async def submit_issue(issue_id: str, request: SubmitRequest):
         raise HTTPException(status_code=500, detail=f"Failed to update issue status: {str(e)}")
     
     logger.info(f"Issue {issue_id} submitted to authorities: {[auth['email'] for auth in selected_authorities]}. Email success: {email_success}")
-    # --- REAL TIME NOTIFICATION ---
-    try:
-        from services.socket_manager import manager
-        # Extract necessary fields from the 'issue' object for the broadcast
-        issue_type = issue.get("issue_type", "Unknown Issue")
-        final_address = issue.get("address", "Unknown Address")
-        severity = issue.get("severity", "medium") # Assuming a default or extracting from issue
-        timestamp = issue.get("timestamp", datetime.utcnow().isoformat()) # Assuming timestamp exists or default
-        latitude = issue.get("latitude", 0.0)
-        longitude = issue.get("longitude", 0.0)
-
-        await manager.broadcast({
-            "event": "new_issue",
-            "issue": {
-                "_id": issue_id,
-                "issue_type": issue_type,
-                "address": final_address,
-                "status": "pending", # Or "submitted" based on the flow
-                "severity": severity,
-                "timestamp": timestamp,
-                "lat": latitude,
-                "lng": longitude
-            }
-        })
-        logger.info(f"📡 Real-time event broadcasted for issue {issue_id}")
-    except Exception as ws_err:
-        logger.error(f"WebSocket broadcast failed: {ws_err}")
-
-    # --- REAL TIME NOTIFICATION (CREATE) ---
-    try:
-        from services.socket_manager import manager
-        await manager.broadcast({
-            "event": "new_issue",
-            "issue": {
-                "_id": issue_id,
-                "issue_type": issue_type,
-                "address": final_address,
-                "status": "pending",
-                "severity": severity,
-                "timestamp": timestamp,
-                "lat": latitude,
-                "lng": longitude
-            }
-        })
-        logger.info(f"📡 Real-time event broadcasted for new issue {issue_id}")
-    except Exception as ws_err:
-        logger.error(f"WebSocket broadcast failed: {ws_err}")
-
     return IssueResponse(
         id=issue_id,
         message=f"Issue submitted successfully to selected authorities. {'Emails sent successfully' if email_success else 'Email sending failed: ' + '; '.join(email_errors)}",
@@ -2073,17 +2182,7 @@ async def get_issue_image(issue_id: str):
     try:
         db = await get_db()
         fs = await get_fs()
-        
-        # Try finding by string ID first
         issue = await db.issues.find_one({"_id": issue_id})
-        
-        # If not found, try by ObjectId
-        if not issue:
-            try:
-                issue = await db.issues.find_one({"_id": ObjectId(issue_id)})
-            except:
-                pass
-                
         if not issue:
             logger.error(f"Issue {issue_id} not found for image retrieval")
             raise HTTPException(status_code=404, detail=f"Issue {issue_id} not found")
@@ -2091,29 +2190,18 @@ async def get_issue_image(issue_id: str):
         image_id = issue.get("image_id")
         if not image_id:
             logger.error(f"No image_id found for issue {issue_id}")
-            # If no image_id, return 404 placeholder or error
             raise HTTPException(status_code=404, detail=f"No image found for issue {issue_id}")
             
         try:
-            # Safely convert to ObjectId
-            oid = ObjectId(image_id)
-            gridout = await fs.open_download_stream(oid)
+            gridout = await fs.open_download_stream(ObjectId(image_id))
             logger.debug(f"Retrieved image {image_id} for issue {issue_id}")
             return StreamingResponse(gridout, media_type="image/jpeg")
-        except (gridfs.errors.NoFile, Exception) as e:
-            logger.warning(f"Failed to retrieve GridFS image {image_id}: {e}")
-            # Try to handle if image_id was stored as filename by mistake (legacy bug)
-            try:
-                # Attempt to find by filename matching image_id
-                cursor = fs.find({"filename": image_id}).limit(1)
-                grid_files = await cursor.to_list(length=1)
-                if grid_files:
-                    gridout = await fs.open_download_stream(grid_files[0]._id)
-                    return StreamingResponse(gridout, media_type="image/jpeg")
-            except Exception:
-                pass
-                
+        except gridfs.errors.NoFile:
+            logger.error(f"Image {image_id} not found in GridFS for issue {issue_id}")
             raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+        except Exception as e:
+            logger.error(f"Failed to retrieve image {image_id} for issue {issue_id}: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to retrieve image: {str(e)}")
     except Exception as e:
         logger.error(f"Failed to process image request for issue {issue_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to process image request: {str(e)}")

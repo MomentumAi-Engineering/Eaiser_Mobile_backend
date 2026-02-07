@@ -1,29 +1,27 @@
+
+# 🔐 EAiSER Mobile Backend .gitignore
+
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Node
-node_modules/
-npm-debug.log*
-.package-lock.json
-
-# Environment / secrets
-.env
-.env.*
-
-# Certificates
-certs/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Virtual Environment
+*.py[cod]
+*$py.class
+*.log
 venv/
 env/
+.env
+.env.bk
+
+# Go
+gateway/gateway.exe
+gateway/main.exe
 
 # Editor
 .vscode/
 .idea/
+
+# Misc
+*.DS_Store
+*.swp
+cleanup_mobile.py
+run_brain.bat
+run_gateway.bat
