@@ -23,6 +23,7 @@ import redis.asyncio as redis
 from redis.asyncio import ConnectionPool
 import os
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 # Load environment variables
 load_dotenv()
@@ -52,7 +53,6 @@ def get_redis_config():
         # Parse Redis URL format: redis://[:password@]host:port[/db]
         # or rediss://[:password@]host:port[/db] for SSL
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(redis_url)
             
             host = parsed.hostname or 'localhost'
@@ -113,80 +113,71 @@ class RedisService:
             bool: True if connection successful, False otherwise
         """
         try:
-            # Check if Redis is available (localhost check for development)
-            if self.redis_host == 'localhost':
-                logger.warning("⚠️ Using localhost Redis - this will fail in production!")
-                logger.warning("⚠️ Please set REDIS_URL environment variable for production deployment")
-                logger.info("💡 For development, you can:")
-                logger.info("   1. Install Redis locally: https://redis.io/download")
-                logger.info("   2. Use Docker: docker run -d -p 6379:6379 redis:alpine")
-                logger.info("   3. Skip Redis (app will work without caching)")
-            
-            # Prefer REDIS_URL to avoid low-level SSL kwarg incompatibilities across client versions
+            # 🟢 Guard: Check REDIS_URL validity strictly
             redis_url = os.getenv('REDIS_URL')
-            if redis_url:
-                # Fix malformed URLs (missing scheme)
-                if not redis_url.startswith(('redis://', 'rediss://', 'unix://')):
+            
+            # Smart Logic: Construct URL if missing but host/port exist (Legacy/Dev)
+            if not redis_url:
+                if self.redis_host and self.redis_host != 'localhost':
+                     if self.redis_password:
+                        redis_url = f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+                     else:
+                        redis_url = f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
+                elif self.redis_host == 'localhost':
+                     logger.info("⚠️ No REDIS_URL set. Using localhost (Development Logic).")
+                     redis_url = "redis://localhost:6379/0"
+
+            # 🟢 Guard Clause requested by User
+            if not redis_url or not redis_url.startswith(("redis://", "rediss://", "unix://")):
+                if redis_url and not redis_url.startswith(("redis://", "rediss://", "unix://")):
+                     # Try to auto-fix simple host:port strings
                      logger.warning(f"⚠️ Malformed REDIS_URL detected. Auto-fixing to 'redis://{redis_url}'")
                      redis_url = f"redis://{redis_url}"
+                else:
+                    logger.warning("⚠️ Invalid or Missing REDIS_URL. Redis disabled.")
+                    self.is_connected = False
+                    return False
 
-                # Use ConnectionPool.from_url to let the client handle ssl/rediss scheme internally
-                pool_kwargs = {
-                    'decode_responses': True,
-                    'max_connections': 20,
-                    'retry_on_timeout': True,
-                    'socket_connect_timeout': 10,
-                    'socket_timeout': 10,
-                    'health_check_interval': 30,
-                }
-                # If using rediss (TLS), relax cert checks for managed services without CA bundles
-                try:
-                    from urllib.parse import urlparse
-                    if urlparse(redis_url).scheme == 'rediss':
-                        pool_kwargs['ssl_cert_reqs'] = None
-                        pool_kwargs['ssl_check_hostname'] = False
-                        logger.info("🔒 TLS (rediss) detected; cert verification disabled for managed Redis")
-                except Exception:
-                    pass
-                self.connection_pool = ConnectionPool.from_url(redis_url, **pool_kwargs)
-                self.redis_client = redis.Redis(connection_pool=self.connection_pool)
-            else:
-                # Fallback: build by host/port without explicit 'ssl' kwarg
-                self.connection_pool = ConnectionPool(
-                    host=self.redis_host,
-                    port=self.redis_port,
-                    password=self.redis_password,
-                    db=self.redis_db,
-                    decode_responses=True,
-                    max_connections=20,
-                    retry_on_timeout=True,
-                    socket_connect_timeout=10,
-                    socket_timeout=10,
-                    health_check_interval=30,
-                )
-                self.redis_client = redis.Redis(connection_pool=self.connection_pool)
+            # Use ConnectionPool.from_url to let the client handle ssl/rediss scheme internally
+            pool_kwargs = {
+                'decode_responses': True,
+                'max_connections': 20,
+                'retry_on_timeout': True,
+                'socket_connect_timeout': 5, # Fast fail as requested
+                'socket_timeout': 5,
+                'health_check_interval': 30,
+            }
+            
+            # If using rediss (TLS), relax cert checks for managed services without CA bundles
+            try:
+                parsed = urlparse(redis_url)
+                if parsed.scheme == 'rediss':
+                    pool_kwargs['ssl_cert_reqs'] = None
+                    pool_kwargs['ssl_check_hostname'] = False
+                    logger.info("🔒 TLS (rediss) detected; cert verification disabled for managed Redis")
+            except Exception:
+                pass
+
+            self.connection_pool = ConnectionPool.from_url(redis_url, **pool_kwargs)
+            self.redis_client = redis.Redis(connection_pool=self.connection_pool)
             
             # Test connection with timeout
             await asyncio.wait_for(self.redis_client.ping(), timeout=5.0)
             self.is_connected = True
             
-            logger.info(f"✅ Redis connected successfully to {self.redis_host}:{self.redis_port}")
-            logger.info(f"🚀 Redis caching enabled - performance optimized!")
+            logger.info("✅ Redis connected successfully")
             return True
             
         except asyncio.TimeoutError:
-            logger.warning(f"⏰ Redis connection timeout to {self.redis_host}:{self.redis_port}")
-            logger.warning("💡 This is normal if Redis is not available - app will work without caching")
+            logger.warning(f"⏰ Redis connection timeout")
             self.is_connected = False
             return False
         except ConnectionRefusedError:
-            logger.warning(f"🚫 Redis connection refused to {self.redis_host}:{self.redis_port}")
-            logger.warning("💡 Redis server not running - app will work without caching")
+            logger.warning(f"🚫 Redis connection refused")
             self.is_connected = False
             return False
         except Exception as e:
             logger.warning(f"⚠️ Redis connection failed: {str(e)}")
-            logger.warning("💡 App will continue without caching - performance may be slower")
             self.is_connected = False
             return False
     
@@ -448,10 +439,9 @@ async def init_redis():
     """
     try:
         success = await redis_service.connect()
-        if success:
-            logger.info("✅ Redis caching service initialized successfully")
-        else:
-            logger.warning("⚠️ Redis unavailable - continuing without caching")
+        if not success:
+             # Logic is handled inside connect logs
+             pass
     except Exception as e:
         logger.warning(f"⚠️ Redis initialization failed: {str(e)} - continuing without caching")
 

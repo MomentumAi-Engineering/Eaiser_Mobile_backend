@@ -32,3 +32,5 @@ celery==5.5.3
 flower==2.0.1
 # Event loop policy needed for Windows Celery
 gevent==24.11.1
+# Performance optimization for MongoDB wire protocol
+python-snappy==0.7.1
