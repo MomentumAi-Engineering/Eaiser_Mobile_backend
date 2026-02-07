@@ -25,3 +25,9 @@ gateway/main.exe
 cleanup_mobile.py
 run_brain.bat
 run_gateway.bat
+
+# Node.js (Dependencies)
+node_modules/
+test/node_modules/
+dist/
+build/
